@@ -46,23 +46,29 @@ async function loadMonitoredPairs(): Promise<string[]> {
     
     if (error) {
       console.error('[CONFIG] Error loading monitored_pairs:', error.message);
-      console.warn('[CONFIG] Using default pairs: BTCUSDT, ETHUSDT, BNBUSDT');
-      return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+      console.warn('[CONFIG] No monitored pairs found - returning empty array');
+      return [];
     }
     
     if (!data || !data.value) {
-      console.warn('[CONFIG] No monitored_pairs found in database, using defaults');
-      return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+      console.warn('[CONFIG] No monitored_pairs in database - returning empty array');
+      return [];
     }
     
     const pairs = JSON.parse(data.value);
+    
+    if (pairs.length === 0) {
+      console.warn('[CONFIG] Monitored pairs array is empty');
+      return [];
+    }
+    
     console.log('[CONFIG] ✓ Loaded monitored pairs:', pairs.join(', '));
     return pairs;
     
   } catch (err) {
     console.error('[CONFIG] Exception loading monitored pairs:', err);
-    console.warn('[CONFIG] Using default pairs: BTCUSDT, ETHUSDT, BNBUSDT');
-    return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+    console.warn('[CONFIG] Returning empty array due to error');
+    return [];
   }
 }
 
@@ -99,6 +105,11 @@ class BaselineTracker {
   get(symbol: string): number {
     return this.baselines.get(symbol) || 0;
   }
+
+  clear() {
+    this.baselines.clear();
+    this.lastUpdate.clear();
+  }
 }
 
 // ============================================================================
@@ -132,6 +143,10 @@ class PriceHistoryTracker {
     const oldestPrice = history[0].price;
     return ((currentPrice - oldestPrice) / oldestPrice) * 100;
   }
+
+  clear() {
+    this.history.clear();
+  }
 }
 
 // ============================================================================
@@ -142,7 +157,7 @@ class TriggerDetector {
   private baselineTracker = new BaselineTracker();
   private priceHistory = new PriceHistoryTracker();
   private recentTriggers: Map<string, number> = new Map();
-  private readonly TRIGGER_COOLDOWN = 60000; // 10 minutes
+  private readonly TRIGGER_COOLDOWN = 60000; // 1 minute (lowered for testing)
 
   async checkVolumeTrigger(symbol: string, tickerData: any) {
     const currentVolume = parseFloat(tickerData.q); // 24h quote volume
@@ -157,7 +172,7 @@ class TriggerDetector {
     const baseline = this.baselineTracker.get(symbol);
     const volumeRatio = currentVolume / baseline;
 
-    const volumeThreshold = 1.01; // 150%
+    const volumeThreshold = 1.01; // 101% (lowered for testing)
 
     if (volumeRatio > volumeThreshold) {
       await this.createTrigger(symbol, 'volume_spike', volumeRatio, volumeThreshold, {
@@ -177,7 +192,7 @@ class TriggerDetector {
     // Calculate 5-min change
     const priceChange = this.priceHistory.getChange(symbol, currentPrice);
 
-    const priceThreshold = 0.1; // 2%
+    const priceThreshold = 0.1; // 0.1% (lowered for testing)
 
     if (Math.abs(priceChange) >= priceThreshold) {
       await this.createTrigger(symbol, 'price_move', priceChange, priceThreshold, {
@@ -250,6 +265,12 @@ class TriggerDetector {
       console.error('[TRIGGER] Error:', err);
     }
   }
+
+  reset() {
+    this.baselineTracker.clear();
+    this.priceHistory.clear();
+    this.recentTriggers.clear();
+  }
 }
 
 // ============================================================================
@@ -261,6 +282,7 @@ class BinanceMonitor {
   private triggerDetector = new TriggerDetector();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private statusCheckTimer: NodeJS.Timeout | null = null;
+  private pairCheckTimer: NodeJS.Timeout | null = null;
   private monitoredSymbols: string[] = [];
   private isMonitoring: boolean = false;
 
@@ -271,14 +293,16 @@ class BinanceMonitor {
     this.monitoredSymbols = await loadMonitoredPairs();
     
     if (this.monitoredSymbols.length === 0) {
-      console.error('[MONITOR] No symbols to monitor! Exiting...');
-      process.exit(1);
+      console.warn('[MONITOR] No trading pairs configured - will wait for pairs to be added');
+    } else {
+      console.log('[MONITOR] Monitored symbols configured:', this.monitoredSymbols.join(', '));
     }
-    
-    console.log('[MONITOR] Monitored symbols configured:', this.monitoredSymbols.join(', '));
     
     // Start status check loop
     this.startStatusCheckLoop();
+    
+    // Start pair check loop
+    this.startPairCheckLoop();
   }
 
   private async startStatusCheckLoop() {
@@ -291,6 +315,49 @@ class BinanceMonitor {
     }, 10000);
   }
 
+  private startPairCheckLoop() {
+    // Check immediately
+    this.checkAndUpdatePairs();
+    
+    // Then check every 60 seconds
+    this.pairCheckTimer = setInterval(async () => {
+      await this.checkAndUpdatePairs();
+    }, 60000); // Every 60 seconds
+  }
+
+  private async checkAndUpdatePairs() {
+    const newPairs = await loadMonitoredPairs();
+    
+    // Compare with current pairs
+    const pairsChanged = JSON.stringify(newPairs.sort()) !== JSON.stringify(this.monitoredSymbols.sort());
+    
+    if (pairsChanged) {
+      console.log('[CONFIG] Monitored pairs changed!');
+      console.log('[CONFIG] Old pairs:', this.monitoredSymbols.join(', ') || 'none');
+      console.log('[CONFIG] New pairs:', newPairs.join(', ') || 'none');
+      
+      this.monitoredSymbols = newPairs;
+      
+      // If monitoring is active, reconnect with new pairs
+      if (this.isMonitoring) {
+        if (newPairs.length === 0) {
+          // Pairs became empty - disconnect from Binance
+          console.log('[MONITOR] All pairs removed - disconnecting from Binance...');
+          this.stopMonitoring();
+          console.log('[MONITOR] Waiting for trading pairs to be added...');
+        } else {
+          // Pairs changed - reconnect
+          console.log('[MONITOR] Reconnecting with new pairs...');
+          this.stopMonitoring();
+          // Small delay before reconnecting
+          setTimeout(() => {
+            this.startMonitoring();
+          }, 1000);
+        }
+      }
+    }
+  }
+
   private async checkAndUpdateStatus() {
     const status = await getScannerStatus();
     
@@ -300,8 +367,6 @@ class BinanceMonitor {
     } else if (status === 'stopped' && this.isMonitoring) {
       console.log('[MONITOR] ✗ Scanner status: STOPPED - Stopping monitoring...');
       this.stopMonitoring();
-    } else if (status === 'running' && this.isMonitoring) {
-      // Still running, all good (log less frequently)
     } else if (status === 'stopped' && !this.isMonitoring) {
       // Still stopped, waiting
       console.log('[MONITOR] Waiting for scanner to start... (status: stopped)');
@@ -311,13 +376,27 @@ class BinanceMonitor {
   private startMonitoring() {
     if (this.isMonitoring) return;
     
+    // Check if we have pairs before connecting
+    if (this.monitoredSymbols.length === 0) {
+      console.warn('[MONITOR] Cannot start monitoring - no trading pairs configured');
+      console.log('[MONITOR] Waiting for trading pairs to be added...');
+      return; // Don't start monitoring
+    }
+    
     this.isMonitoring = true;
     console.log('[MONITOR] Starting Binance WebSocket connection...');
     this.connect();
   }
 
   private stopMonitoring() {
-    if (!this.isMonitoring) return;
+    if (!this.isMonitoring) {
+      // Already stopped, just clean up
+      if (this.ws) {
+        this.ws.close();
+        this.ws = null;
+      }
+      return;
+    }
     
     this.isMonitoring = false;
     console.log('[MONITOR] Stopping Binance WebSocket connection...');
@@ -332,11 +411,19 @@ class BinanceMonitor {
       this.ws = null;
     }
     
+    // Reset detector state when stopping
+    this.triggerDetector.reset();
+    
     console.log('[MONITOR] ✓ Monitoring stopped');
   }
 
   private connect() {
     if (!this.isMonitoring) return; // Don't connect if not monitoring
+    
+    if (this.monitoredSymbols.length === 0) {
+      console.warn('[MONITOR] Cannot connect - no pairs configured');
+      return;
+    }
     
     try {
       // Build streams
@@ -403,7 +490,7 @@ class BinanceMonitor {
     }
 
     this.reconnectTimer = setTimeout(() => {
-      if (this.isMonitoring) {
+      if (this.isMonitoring && this.monitoredSymbols.length > 0) {
         this.connect();
       }
     }, 5000);
@@ -415,6 +502,11 @@ class BinanceMonitor {
     if (this.statusCheckTimer) {
       clearInterval(this.statusCheckTimer);
       this.statusCheckTimer = null;
+    }
+    
+    if (this.pairCheckTimer) {
+      clearInterval(this.pairCheckTimer);
+      this.pairCheckTimer = null;
     }
     
     this.stopMonitoring();
@@ -457,6 +549,7 @@ async function main() {
   });
 
   console.log('[MONITOR] Service running. Checking scanner status every 10 seconds...');
+  console.log('[MONITOR] Checking monitored pairs every 60 seconds...');
 }
 
 // Start
@@ -464,4 +557,3 @@ main().catch(err => {
   console.error('[FATAL]', err);
   process.exit(1);
 });
-
