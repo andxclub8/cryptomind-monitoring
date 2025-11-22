@@ -223,49 +223,81 @@ class TriggerDetector {
     // Record trigger
     this.recentTriggers.set(`${symbol}-${type}`, Date.now());
 
-    // Save to database
+    // Save to database and get the trigger ID
     try {
-      const { error } = await supabase.from('monitoring_triggers').insert({
-        symbol,
-        trigger_type: type,
-        trigger_value: value.toFixed(3),
-        threshold_used: threshold.toString(),
-        metadata,
-        analysis_started: false
-      });
+      console.log(`[TRIGGER] Creating trigger record in database...`);
+      
+      const { data: triggerData, error: insertError } = await supabase
+        .from('monitoring_triggers')
+        .insert({
+          symbol,
+          trigger_type: type,
+          trigger_value: value.toFixed(3),
+          threshold_used: threshold.toString(),
+          metadata,
+          analysis_started: false
+        })
+        .select()
+        .single();
 
-      if (error) {
-        console.error('[TRIGGER] Database error:', error.message);
+      if (insertError || !triggerData) {
+        console.error('[TRIGGER] Database error:', insertError?.message);
         return;
       }
 
-      // Invoke analyze-full Edge Function
-      console.log(`[TRIGGER] Invoking analyze-full for ${symbol}...`);
+      const triggerId = triggerData.id;
+      console.log(`[TRIGGER] ✓ Trigger record created with ID: ${triggerId}`);
+
+      // Invoke analyze-full Edge Function with correct parameters
+      console.log(`[TRIGGER] Invoking analyze-full for ${symbol} (trigger ID: ${triggerId})...`);
       
-      const { error: invokeError } = await supabase.functions.invoke('analyze-full', {
+      const { data: analysisData, error: invokeError } = await supabase.functions.invoke('analyze-full', {
         body: {
           symbol,
-          trigger_type: type,
-          trigger_value: value
+          triggerId  // Pass the trigger ID so analyze-full can link the analysis
         }
       });
 
       if (invokeError) {
         console.error('[TRIGGER] Failed to invoke analyze-full:', invokeError.message);
-      } else {
-        console.log(`[TRIGGER] ✓ Analysis started for ${symbol}`);
+        console.error('[TRIGGER] Error details:', invokeError);
         
-        // Update trigger record
+        // Update trigger to show invocation failed
         await supabase
           .from('monitoring_triggers')
-          .update({ analysis_started: true })
-          .eq('symbol', symbol)
-          .eq('trigger_type', type)
-          .order('triggered_at', { ascending: false })
-          .limit(1);
+          .update({ 
+            analysis_started: false,
+            metadata: { 
+              ...metadata, 
+              invocation_error: invokeError.message 
+            }
+          })
+          .eq('id', triggerId);
+        
+        return;
       }
+
+      console.log(`[TRIGGER] ✓ analyze-full invoked successfully`);
+      
+      // Log the response if available
+      if (analysisData) {
+        console.log(`[TRIGGER] Analysis response:`, JSON.stringify(analysisData).substring(0, 200));
+      }
+      
+      // Update trigger record to mark analysis as started
+      const { error: updateError } = await supabase
+        .from('monitoring_triggers')
+        .update({ analysis_started: true })
+        .eq('id', triggerId);
+      
+      if (updateError) {
+        console.error('[TRIGGER] Failed to update trigger record:', updateError.message);
+      } else {
+        console.log(`[TRIGGER] ✓ Trigger record updated (analysis_started = true)`);
+      }
+
     } catch (err) {
-      console.error('[TRIGGER] Error:', err);
+      console.error('[TRIGGER] Exception in createTrigger:', err);
     }
   }
 
