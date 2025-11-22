@@ -223,7 +223,7 @@ class TriggerDetector {
     // Record trigger
     this.recentTriggers.set(`${symbol}-${type}`, Date.now());
 
-    // Save to database and get the trigger ID
+    // Save to database - Database Trigger will automatically invoke analyze-full
     try {
       console.log(`[TRIGGER] Creating trigger record in database...`);
       
@@ -235,7 +235,7 @@ class TriggerDetector {
           trigger_value: value.toFixed(3),
           threshold_used: threshold.toString(),
           metadata,
-          analysis_started: false
+          analysis_started: false  // Database trigger will update this
         })
         .select()
         .single();
@@ -247,54 +247,7 @@ class TriggerDetector {
 
       const triggerId = triggerData.id;
       console.log(`[TRIGGER] ✓ Trigger record created with ID: ${triggerId}`);
-
-      // Invoke analyze-full Edge Function with correct parameters
-      console.log(`[TRIGGER] Invoking analyze-full for ${symbol} (trigger ID: ${triggerId})...`);
-      
-      const { data: analysisData, error: invokeError } = await supabase.functions.invoke('analyze-full', {
-        body: {
-          symbol,
-          triggerId  // Pass the trigger ID so analyze-full can link the analysis
-        }
-      });
-
-      if (invokeError) {
-        console.error('[TRIGGER] Failed to invoke analyze-full:', invokeError.message);
-        console.error('[TRIGGER] Error details:', invokeError);
-        
-        // Update trigger to show invocation failed
-        await supabase
-          .from('monitoring_triggers')
-          .update({ 
-            analysis_started: false,
-            metadata: { 
-              ...metadata, 
-              invocation_error: invokeError.message 
-            }
-          })
-          .eq('id', triggerId);
-        
-        return;
-      }
-
-      console.log(`[TRIGGER] ✓ analyze-full invoked successfully`);
-      
-      // Log the response if available
-      if (analysisData) {
-        console.log(`[TRIGGER] Analysis response:`, JSON.stringify(analysisData).substring(0, 200));
-      }
-      
-      // Update trigger record to mark analysis as started
-      const { error: updateError } = await supabase
-        .from('monitoring_triggers')
-        .update({ analysis_started: true })
-        .eq('id', triggerId);
-      
-      if (updateError) {
-        console.error('[TRIGGER] Failed to update trigger record:', updateError.message);
-      } else {
-        console.log(`[TRIGGER] ✓ Trigger record updated (analysis_started = true)`);
-      }
+      console.log(`[TRIGGER] → Database trigger will automatically invoke analyze-full`);
 
     } catch (err) {
       console.error('[TRIGGER] Exception in createTrigger:', err);
@@ -615,6 +568,7 @@ async function main() {
   });
 
   console.log('[MONITOR] Service running. Checking scanner status every 10 seconds...');
+  console.log('[MONITOR] Note: Database trigger will automatically invoke analyze-full for new triggers');
 }
 
 // Start
