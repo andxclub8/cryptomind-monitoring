@@ -264,7 +264,7 @@ class BinanceMonitor {
         `${symbol.toLowerCase()}@ticker`
       ).join('/');
 
-      const wsUrl = `wss://stream.binance.com:9443/stream?streams=${streams}`;
+      const wsUrl = `wss://data-stream.binance.vision/stream?streams=${streams}`;
       
       console.log('[MONITOR] Connecting to Binance...');
       this.ws = new WebSocket(wsUrl);
@@ -378,3 +378,4 @@ main().catch(err => {
   console.error('[FATAL]', err);
   process.exit(1);
 });
+
