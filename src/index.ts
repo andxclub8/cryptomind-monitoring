@@ -1,4 +1,4 @@
-﻿import WebSocket from 'ws';
+import WebSocket from 'ws';
 import { createClient } from '@supabase/supabase-js';
 
 // ============================================================================
@@ -7,9 +7,44 @@ import { createClient } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
-const MONITORED_SYMBOLS = (process.env.MONITORED_SYMBOLS || 'BTCUSDT,ETHUSDT,BNBUSDT').split(',');
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ============================================================================
+// LOAD MONITORED PAIRS FROM SUPABASE
+// ============================================================================
+
+async function loadMonitoredPairs(): Promise<string[]> {
+  try {
+    console.log('[CONFIG] Loading monitored pairs from Supabase...');
+    
+    const { data, error } = await supabase
+      .from('system_config')
+      .select('value')
+      .eq('key', 'monitored_pairs')
+      .single();
+    
+    if (error) {
+      console.error('[CONFIG] Error loading monitored_pairs:', error.message);
+      console.warn('[CONFIG] Using default pairs: BTCUSDT, ETHUSDT, BNBUSDT');
+      return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+    }
+    
+    if (!data || !data.value) {
+      console.warn('[CONFIG] No monitored_pairs found in database, using defaults');
+      return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+    }
+    
+    const pairs = JSON.parse(data.value);
+    console.log('[CONFIG] ✓ Loaded monitored pairs:', pairs.join(', '));
+    return pairs;
+    
+  } catch (err) {
+    console.error('[CONFIG] Exception loading monitored pairs:', err);
+    console.warn('[CONFIG] Using default pairs: BTCUSDT, ETHUSDT, BNBUSDT');
+    return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+  }
+}
 
 // ============================================================================
 // BASELINE TRACKER
@@ -205,17 +240,27 @@ class BinanceMonitor {
   private ws: WebSocket | null = null;
   private triggerDetector = new TriggerDetector();
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private monitoredSymbols: string[] = [];
 
-  start() {
+  async start() {
     console.log('[MONITOR] Starting Binance WebSocket monitor...');
-    console.log('[MONITOR] Monitored symbols:', MONITORED_SYMBOLS.join(', '));
+    
+    // Load monitored pairs from Supabase
+    this.monitoredSymbols = await loadMonitoredPairs();
+    
+    if (this.monitoredSymbols.length === 0) {
+      console.error('[MONITOR] No symbols to monitor! Exiting...');
+      process.exit(1);
+    }
+    
+    console.log('[MONITOR] Monitored symbols:', this.monitoredSymbols.join(', '));
     this.connect();
   }
 
   private connect() {
     try {
       // Build streams
-      const streams = MONITORED_SYMBOLS.map(symbol => 
+      const streams = this.monitoredSymbols.map(symbol => 
         `${symbol.toLowerCase()}@ticker`
       ).join('/');
 
@@ -226,7 +271,7 @@ class BinanceMonitor {
 
       this.ws.on('open', () => {
         console.log('[MONITOR] ✓ Connected to Binance WebSocket');
-        console.log(`[MONITOR] ✓ Subscribed to ${MONITORED_SYMBOLS.length} symbols`);
+        console.log(`[MONITOR] ✓ Subscribed to ${this.monitoredSymbols.length} symbols`);
       });
 
       this.ws.on('message', (data: WebSocket.Data) => {
@@ -294,35 +339,42 @@ class BinanceMonitor {
 // MAIN
 // ============================================================================
 
-console.log('='.repeat(60));
-console.log('CryptoMind AI - Monitoring Service v1.0.0');
-console.log('='.repeat(60));
+async function main() {
+  console.log('='.repeat(60));
+  console.log('CryptoMind AI - Monitoring Service v1.0.0');
+  console.log('='.repeat(60));
 
-// Validate environment
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error('[ERROR] Missing environment variables!');
-  console.error('[ERROR] Required: SUPABASE_URL, SUPABASE_ANON_KEY');
-  process.exit(1);
+  // Validate environment
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error('[ERROR] Missing environment variables!');
+    console.error('[ERROR] Required: SUPABASE_URL, SUPABASE_ANON_KEY');
+    process.exit(1);
+  }
+
+  console.log('[CONFIG] Supabase URL:', SUPABASE_URL);
+
+  // Start monitor
+  const monitor = new BinanceMonitor();
+  await monitor.start();
+
+  // Handle shutdown
+  process.on('SIGINT', () => {
+    console.log('\n[SHUTDOWN] Received SIGINT, stopping...');
+    monitor.stop();
+    process.exit(0);
+  });
+
+  process.on('SIGTERM', () => {
+    console.log('\n[SHUTDOWN] Received SIGTERM, stopping...');
+    monitor.stop();
+    process.exit(0);
+  });
+
+  console.log('[MONITOR] Service started. Press Ctrl+C to stop.');
 }
 
-console.log('[CONFIG] Supabase URL:', SUPABASE_URL);
-console.log('[CONFIG] Monitored symbols:', MONITORED_SYMBOLS.join(', '));
-
-// Start monitor
-const monitor = new BinanceMonitor();
-monitor.start();
-
-// Handle shutdown
-process.on('SIGINT', () => {
-  console.log('\n[SHUTDOWN] Received SIGINT, stopping...');
-  monitor.stop();
-  process.exit(0);
+// Start
+main().catch(err => {
+  console.error('[FATAL]', err);
+  process.exit(1);
 });
-
-process.on('SIGTERM', () => {
-  console.log('\n[SHUTDOWN] Received SIGTERM, stopping...');
-  monitor.stop();
-  process.exit(0);
-});
-
-console.log('[MONITOR] Service started. Press Ctrl+C to stop.');
