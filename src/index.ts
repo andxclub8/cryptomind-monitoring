@@ -11,8 +11,28 @@ const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ============================================================================
-// LOAD MONITORED PAIRS FROM SUPABASE
+// CONFIGURATION HELPERS
 // ============================================================================
+
+async function getScannerStatus(): Promise<string> {
+  try {
+    const { data, error } = await supabase
+      .from('system_config')
+      .select('value')
+      .eq('key', 'scanner_status')
+      .single();
+    
+    if (error || !data) {
+      console.log('[CONFIG] No scanner_status found, defaulting to stopped');
+      return 'stopped';
+    }
+    
+    return data.value;
+  } catch (err) {
+    console.error('[CONFIG] Error loading scanner_status:', err);
+    return 'stopped';
+  }
+}
 
 async function loadMonitoredPairs(): Promise<string[]> {
   try {
@@ -240,10 +260,12 @@ class BinanceMonitor {
   private ws: WebSocket | null = null;
   private triggerDetector = new TriggerDetector();
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private statusCheckTimer: NodeJS.Timeout | null = null;
   private monitoredSymbols: string[] = [];
+  private isMonitoring: boolean = false;
 
   async start() {
-    console.log('[MONITOR] Starting Binance WebSocket monitor...');
+    console.log('[MONITOR] Monitoring service started');
     
     // Load monitored pairs from Supabase
     this.monitoredSymbols = await loadMonitoredPairs();
@@ -253,11 +275,69 @@ class BinanceMonitor {
       process.exit(1);
     }
     
-    console.log('[MONITOR] Monitored symbols:', this.monitoredSymbols.join(', '));
+    console.log('[MONITOR] Monitored symbols configured:', this.monitoredSymbols.join(', '));
+    
+    // Start status check loop
+    this.startStatusCheckLoop();
+  }
+
+  private async startStatusCheckLoop() {
+    // Check immediately
+    await this.checkAndUpdateStatus();
+    
+    // Then check every 10 seconds
+    this.statusCheckTimer = setInterval(async () => {
+      await this.checkAndUpdateStatus();
+    }, 10000);
+  }
+
+  private async checkAndUpdateStatus() {
+    const status = await getScannerStatus();
+    
+    if (status === 'running' && !this.isMonitoring) {
+      console.log('[MONITOR] ✓ Scanner status: RUNNING - Starting monitoring...');
+      this.startMonitoring();
+    } else if (status === 'stopped' && this.isMonitoring) {
+      console.log('[MONITOR] ✗ Scanner status: STOPPED - Stopping monitoring...');
+      this.stopMonitoring();
+    } else if (status === 'running' && this.isMonitoring) {
+      // Still running, all good (log less frequently)
+    } else if (status === 'stopped' && !this.isMonitoring) {
+      // Still stopped, waiting
+      console.log('[MONITOR] Waiting for scanner to start... (status: stopped)');
+    }
+  }
+
+  private startMonitoring() {
+    if (this.isMonitoring) return;
+    
+    this.isMonitoring = true;
+    console.log('[MONITOR] Starting Binance WebSocket connection...');
     this.connect();
   }
 
+  private stopMonitoring() {
+    if (!this.isMonitoring) return;
+    
+    this.isMonitoring = false;
+    console.log('[MONITOR] Stopping Binance WebSocket connection...');
+    
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    
+    console.log('[MONITOR] ✓ Monitoring stopped');
+  }
+
   private connect() {
+    if (!this.isMonitoring) return; // Don't connect if not monitoring
+    
     try {
       // Build streams
       const streams = this.monitoredSymbols.map(symbol => 
@@ -283,13 +363,20 @@ class BinanceMonitor {
       });
 
       this.ws.on('close', () => {
-        console.log('[MONITOR] WebSocket closed. Reconnecting in 5 seconds...');
-        this.scheduleReconnect();
+        console.log('[MONITOR] WebSocket closed');
+        
+        // Only reconnect if still monitoring
+        if (this.isMonitoring) {
+          console.log('[MONITOR] Reconnecting in 5 seconds...');
+          this.scheduleReconnect();
+        }
       });
 
     } catch (error) {
       console.error('[MONITOR] Connection error:', error);
-      this.scheduleReconnect();
+      if (this.isMonitoring) {
+        this.scheduleReconnect();
+      }
     }
   }
 
@@ -316,22 +403,21 @@ class BinanceMonitor {
     }
 
     this.reconnectTimer = setTimeout(() => {
-      this.connect();
+      if (this.isMonitoring) {
+        this.connect();
+      }
     }, 5000);
   }
 
   stop() {
-    console.log('[MONITOR] Stopping monitor...');
+    console.log('[MONITOR] Shutting down monitoring service...');
     
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
+    if (this.statusCheckTimer) {
+      clearInterval(this.statusCheckTimer);
+      this.statusCheckTimer = null;
     }
-
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    
+    this.stopMonitoring();
   }
 }
 
@@ -370,7 +456,7 @@ async function main() {
     process.exit(0);
   });
 
-  console.log('[MONITOR] Service started. Press Ctrl+C to stop.');
+  console.log('[MONITOR] Service running. Checking scanner status every 10 seconds...');
 }
 
 // Start
@@ -378,4 +464,3 @@ main().catch(err => {
   console.error('[FATAL]', err);
   process.exit(1);
 });
-
