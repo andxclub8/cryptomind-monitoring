@@ -160,7 +160,7 @@ class TriggerDetector {
   private baselineTracker = new BaselineTracker();
   private priceHistory = new PriceHistoryTracker();
   private recentTriggers: Map<string, number> = new Map();
-  private readonly TRIGGER_COOLDOWN = 60000; // 1 minute (lowered for testing)
+  private readonly TRIGGER_COOLDOWN = 300000; // 5 minute (lowered for testing)
 
   async checkVolumeTrigger(symbol: string, tickerData: any) {
     const currentVolume = parseFloat(tickerData.q); // 24h quote volume
@@ -175,7 +175,7 @@ class TriggerDetector {
     const baseline = this.baselineTracker.get(symbol);
     const volumeRatio = currentVolume / baseline;
 
-    const volumeThreshold = 1.01; // 101% (lowered for testing)
+    const volumeThreshold = 1.20; // 120% (lowered for testing)
 
     if (volumeRatio > volumeThreshold) {
       await this.createTrigger(symbol, 'volume_spike', volumeRatio, volumeThreshold, {
@@ -195,7 +195,7 @@ class TriggerDetector {
     // Calculate 5-min change
     const priceChange = this.priceHistory.getChange(symbol, currentPrice);
 
-    const priceThreshold = 0.1; // 0.1% (lowered for testing)
+    const priceThreshold = 0.5; // 0.5% (lowered for testing)
 
     if (Math.abs(priceChange) >= priceThreshold) {
       await this.createTrigger(symbol, 'price_move', priceChange, priceThreshold, {
@@ -576,3 +576,4 @@ main().catch(err => {
   console.error('[FATAL]', err);
   process.exit(1);
 });
+
