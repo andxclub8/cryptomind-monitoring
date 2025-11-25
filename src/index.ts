@@ -10,6 +10,26 @@ const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+
+// ============================================================================
+// INTERFACES
+// ============================================================================
+
+interface ActiveStrategy {
+  id: string;
+  symbol: string;
+  position_type: 'LONG' | 'SHORT';
+  target_1: number;
+  target_2: number;
+  target_3: number;
+  stop_loss: number;
+  current_price: number;
+  targets_hit: number;
+  status: 'waiting_entry' | 'in_position' | 'paused' | 'completed' | 'stopped';
+  label: string | null;
+  started_at: string;
+}
+
 // ============================================================================
 // CONFIGURATION HELPERS
 // ============================================================================
@@ -265,9 +285,335 @@ class TriggerDetector {
 // BINANCE WEBSOCKET MANAGER
 // ============================================================================
 
+// ============================================================================
+// POSITION MONITOR
+// ============================================================================
+
+class PositionMonitor {
+  private activeStrategies: Map<string, ActiveStrategy[]> = new Map();
+  private reloadTimer: NodeJS.Timeout | null = null;
+  private lastReloadTime: number = 0;
+  private readonly RELOAD_INTERVAL = 15000; // 15 seconds
+  private readonly EPSILON = 0.001; // 0.1% tolerance for price matching
+  private isActive: boolean = false;
+
+  async start() {
+    console.log('[POSITION] Position monitor starting...');
+    this.isActive = true;
+    await this.loadActiveStrategies();
+    this.scheduleReload();
+    console.log('[POSITION] ✓ Position monitor started');
+  }
+
+  stop() {
+    console.log('[POSITION] Stopping position monitor...');
+    this.isActive = false;
+    if (this.reloadTimer) {
+      clearInterval(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+    this.activeStrategies.clear();
+    console.log('[POSITION] ✓ Position monitor stopped');
+  }
+
+  private scheduleReload() {
+    if (this.reloadTimer) clearInterval(this.reloadTimer);
+    
+    this.reloadTimer = setInterval(async () => {
+      if (this.isActive) {
+        await this.loadActiveStrategies();
+      }
+    }, this.RELOAD_INTERVAL);
+  }
+
+  private async loadActiveStrategies() {
+    try {
+      const now = Date.now();
+      
+      // Only log reload every minute to avoid spam
+      if (now - this.lastReloadTime > 60000) {
+        console.log('[POSITION] Reloading active strategies...');
+        this.lastReloadTime = now;
+      }
+      
+      const { data, error } = await supabase
+        .from('active_strategies')
+        .select('*')
+        .in('status', ['waiting_entry', 'in_position'])
+        .order('started_at', { ascending: false });
+
+      if (error) {
+        console.error('[POSITION] Error loading strategies:', error.message);
+        return;
+      }
+
+      // Group strategies by symbol
+      const strategiesBySymbol = new Map<string, ActiveStrategy[]>();
+      
+      if (data && data.length > 0) {
+        for (const strategy of data as ActiveStrategy[]) {
+          const symbol = strategy.symbol;
+          if (!strategiesBySymbol.has(symbol)) {
+            strategiesBySymbol.set(symbol, []);
+          }
+          strategiesBySymbol.get(symbol)!.push(strategy);
+        }
+        
+        // Only log when symbols change
+        const symbolsChanged = 
+          strategiesBySymbol.size !== this.activeStrategies.size ||
+          ![...strategiesBySymbol.keys()].every(k => this.activeStrategies.has(k));
+        
+        if (symbolsChanged) {
+          console.log(`[POSITION] ✓ Loaded ${data.length} active strategies across ${strategiesBySymbol.size} symbols`);
+          console.log('[POSITION] Symbols:', [...strategiesBySymbol.keys()].join(', '));
+        }
+      } else if (this.activeStrategies.size > 0) {
+        console.log('[POSITION] No active strategies to monitor');
+      }
+
+      this.activeStrategies = strategiesBySymbol;
+    } catch (error) {
+      console.error('[POSITION] Exception loading strategies:', error);
+    }
+  }
+
+  checkPrice(symbol: string, currentPrice: number) {
+    const strategies = this.activeStrategies.get(symbol);
+    if (!strategies || strategies.length === 0) return;
+
+    for (const strategy of strategies) {
+      this.checkStrategy(strategy, currentPrice);
+    }
+  }
+
+  private async checkStrategy(strategy: ActiveStrategy, currentPrice: number) {
+    const isLong = strategy.position_type === 'LONG';
+    let needsUpdate = false;
+    let newTargetsHit = strategy.targets_hit;
+    let newStatus = strategy.status;
+
+    // Check targets (support price jumps - check all targets at once)
+    if (strategy.targets_hit === 0) {
+      if (isLong) {
+        if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
+          newTargetsHit = 3;
+          newStatus = 'completed';
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
+        } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
+          newTargetsHit = 2;
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
+        } else if (currentPrice >= strategy.target_1 * (1 - this.EPSILON)) {
+          newTargetsHit = 1;
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
+        }
+      } else { // SHORT
+        if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
+          newTargetsHit = 3;
+          newStatus = 'completed';
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
+        } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
+          newTargetsHit = 2;
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
+        } else if (currentPrice <= strategy.target_1 * (1 + this.EPSILON)) {
+          newTargetsHit = 1;
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
+        }
+      }
+    } else if (strategy.targets_hit === 1) {
+      if (isLong) {
+        if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
+          newTargetsHit = 3;
+          newStatus = 'completed';
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+        } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
+          newTargetsHit = 2;
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
+        }
+      } else { // SHORT
+        if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
+          newTargetsHit = 3;
+          newStatus = 'completed';
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+        } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
+          newTargetsHit = 2;
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
+        }
+      }
+    } else if (strategy.targets_hit === 2) {
+      if (isLong) {
+        if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
+          newTargetsHit = 3;
+          newStatus = 'completed';
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+        }
+      } else { // SHORT
+        if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
+          newTargetsHit = 3;
+          newStatus = 'completed';
+          needsUpdate = true;
+          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+        }
+      }
+    }
+
+    // Check stop loss
+    if (newStatus !== 'stopped' && newStatus !== 'completed') {
+      if (isLong) {
+        if (currentPrice <= strategy.stop_loss * (1 + this.EPSILON)) {
+          newStatus = 'stopped';
+          needsUpdate = true;
+          console.log(`[POSITION] ⚠️ ${strategy.symbol}: STOP LOSS HIT! $${currentPrice.toFixed(2)}`);
+        }
+      } else { // SHORT
+        if (currentPrice >= strategy.stop_loss * (1 - this.EPSILON)) {
+          newStatus = 'stopped';
+          needsUpdate = true;
+          console.log(`[POSITION] ⚠️ ${strategy.symbol}: STOP LOSS HIT! $${currentPrice.toFixed(2)}`);
+        }
+      }
+    }
+
+    if (needsUpdate) {
+      await this.updateStrategy(strategy.id, newTargetsHit, newStatus, currentPrice, strategy);
+      
+      // Update local copy
+      strategy.targets_hit = newTargetsHit;
+      strategy.status = newStatus;
+      strategy.current_price = currentPrice;
+      
+      // Remove from monitoring if completed or stopped
+      if (newStatus === 'completed' || newStatus === 'stopped') {
+        const strategies = this.activeStrategies.get(strategy.symbol);
+        if (strategies) {
+          const index = strategies.findIndex(s => s.id === strategy.id);
+          if (index !== -1) {
+            strategies.splice(index, 1);
+            if (strategies.length === 0) {
+              this.activeStrategies.delete(strategy.symbol);
+            }
+          }
+        }
+      }
+    } else {
+      // Silent update of current price
+      await this.updateCurrentPrice(strategy.id, currentPrice);
+      strategy.current_price = currentPrice;
+    }
+  }
+
+  private async updateStrategy(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy) {
+    try {
+      const { data, error } = await supabase
+        .from('active_strategies')
+        .update({
+          targets_hit: targetsHit,
+          status: status,
+          current_price: currentPrice,
+          last_check_at: new Date().toISOString()
+        })
+        .eq('id', strategyId)
+        .select();
+
+      if (error) {
+        console.error(`[POSITION] Error updating strategy:`, error.message);
+        return;
+      }
+
+      if (!data || data.length === 0) {
+        console.warn(`[POSITION] Strategy already updated (race condition)`);
+        return;
+      }
+
+      console.log(`[POSITION] ✓ Database updated: targets_hit=${targetsHit}, status=${status}`);
+      
+      // Call Edge Function via HTTP
+      await this.notifyStrategyEvent(strategyId, targetsHit, status, currentPrice, strategy);
+
+    } catch (error) {
+      console.error(`[POSITION] Exception updating strategy:`, error);
+    }
+  }
+
+  private async notifyStrategyEvent(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy) {
+    try {
+      let eventType = '';
+      
+      if (targetsHit > strategy.targets_hit) {
+        eventType = `target_${targetsHit}`;
+      } else if (status === 'stopped') {
+        eventType = 'stop_loss';
+      } else if (status === 'completed') {
+        eventType = 'completed';
+      }
+
+      if (!eventType) return;
+
+      const supabaseUrl = process.env.SUPABASE_URL;
+      const supabaseKey = process.env.SUPABASE_ANON_KEY;
+      
+      const response = await fetch(`${supabaseUrl}/functions/v1/notify-strategy-event`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${supabaseKey}`
+        },
+        body: JSON.stringify({
+          strategy_id: strategyId,
+          event_type: eventType,
+          symbol: strategy.symbol,
+          position_type: strategy.position_type,
+          current_price: currentPrice,
+          target_1: strategy.target_1,
+          target_2: strategy.target_2,
+          target_3: strategy.target_3,
+          stop_loss: strategy.stop_loss,
+          targets_hit: targetsHit,
+          status: status,
+          label: strategy.label
+        })
+      });
+
+      if (response.ok) {
+        console.log(`[POSITION] ✓ Telegram notification sent: ${eventType}`);
+      } else {
+        console.error(`[POSITION] Edge Function error: ${response.status}`);
+      }
+    } catch (error) {
+      console.error('[POSITION] Error calling Edge Function:', error);
+    }
+  }
+
+  private async updateCurrentPrice(strategyId: string, currentPrice: number) {
+    try {
+      await supabase
+        .from('active_strategies')
+        .update({
+          current_price: currentPrice,
+          last_check_at: new Date().toISOString()
+        })
+        .eq('id', strategyId);
+    } catch (error) {
+      // Ignore errors for silent updates
+    }
+  }
+}
+
 class BinanceMonitor {
   private ws: WebSocket | null = null;
   private triggerDetector = new TriggerDetector();
+  private positionMonitor = new PositionMonitor();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private statusCheckTimer: NodeJS.Timeout | null = null;
   private pairCheckTimer: NodeJS.Timeout | null = null;
@@ -282,6 +628,8 @@ class BinanceMonitor {
     // Pairs will be loaded when scanner_status becomes 'running'
     
     // Start status check loop
+    await this.positionMonitor.start();
+    
     this.startStatusCheckLoop();
   }
 
@@ -397,7 +745,7 @@ class BinanceMonitor {
   
   private lastStoppedLog: number = 0;
 
-  private startMonitoring() {
+  private async startMonitoring() {
     if (this.isMonitoring) return;
     
     // Double-check we have pairs
@@ -407,6 +755,10 @@ class BinanceMonitor {
     }
     
     this.isMonitoring = true;
+    
+    // Start position monitor
+    await this.positionMonitor.start();
+    
     console.log('[MONITOR] Starting Binance WebSocket connection...');
     this.connect();
   }
@@ -420,6 +772,9 @@ class BinanceMonitor {
       }
       return;
     }
+    
+    // Stop position monitor
+    this.positionMonitor.stop();
     
     this.isMonitoring = false;
     console.log('[MONITOR] Stopping Binance WebSocket connection...');
@@ -501,6 +856,10 @@ class BinanceMonitor {
         // Check triggers
         this.triggerDetector.checkVolumeTrigger(symbol, tickerData);
         this.triggerDetector.checkPriceTrigger(symbol, tickerData);
+        
+        // Check position targets and stop-loss
+        const currentPrice = parseFloat(tickerData.c);
+        this.positionMonitor.checkPrice(symbol, currentPrice);
       }
     } catch (error) {
       // Ignore parse errors (heartbeats, etc.)
@@ -576,4 +935,3 @@ main().catch(err => {
   console.error('[FATAL]', err);
   process.exit(1);
 });
-
