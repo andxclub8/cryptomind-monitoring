@@ -19,6 +19,8 @@ interface ActiveStrategy {
   id: string;
   symbol: string;
   position_type: 'LONG' | 'SHORT';
+  entry_min: number | null;
+  entry_max: number | null;
   target_1: number;
   target_2: number;
   target_3: number;
@@ -282,10 +284,6 @@ class TriggerDetector {
 }
 
 // ============================================================================
-// BINANCE WEBSOCKET MANAGER
-// ============================================================================
-
-// ============================================================================
 // POSITION MONITOR
 // ============================================================================
 
@@ -392,101 +390,152 @@ class PositionMonitor {
     let needsUpdate = false;
     let newTargetsHit = strategy.targets_hit;
     let newStatus = strategy.status;
+    let eventType = '';
 
-    // Check targets (support price jumps - check all targets at once)
-    if (strategy.targets_hit === 0) {
+    // ========================================================================
+    // CHECK ENTRY RANGE (for waiting_entry status)
+    // ========================================================================
+    if (strategy.status === 'waiting_entry' && strategy.entry_min && strategy.entry_max) {
+      let entryReached = false;
+      
       if (isLong) {
-        if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
-          newTargetsHit = 3;
-          newStatus = 'completed';
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
-        } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
-          newTargetsHit = 2;
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
-        } else if (currentPrice >= strategy.target_1 * (1 - this.EPSILON)) {
-          newTargetsHit = 1;
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
+        // For LONG: price dropped into entry zone (at or below entry_max)
+        if (currentPrice <= strategy.entry_max) {
+          entryReached = true;
         }
-      } else { // SHORT
-        if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
-          newTargetsHit = 3;
-          newStatus = 'completed';
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
-        } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
-          newTargetsHit = 2;
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
-        } else if (currentPrice <= strategy.target_1 * (1 + this.EPSILON)) {
-          newTargetsHit = 1;
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
+      } else {
+        // For SHORT: price rose into entry zone (at or above entry_min)
+        if (currentPrice >= strategy.entry_min) {
+          entryReached = true;
         }
       }
-    } else if (strategy.targets_hit === 1) {
-      if (isLong) {
-        if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
-          newTargetsHit = 3;
-          newStatus = 'completed';
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
-        } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
-          newTargetsHit = 2;
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
-        }
-      } else { // SHORT
-        if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
-          newTargetsHit = 3;
-          newStatus = 'completed';
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
-        } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
-          newTargetsHit = 2;
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
-        }
+      
+      if (entryReached) {
+        newStatus = 'in_position';
+        needsUpdate = true;
+        eventType = 'entry_reached';
+        console.log(`[POSITION] 🎯 ${strategy.symbol}: ENTRY ZONE REACHED! $${currentPrice.toFixed(2)} (range: $${strategy.entry_min.toFixed(2)} - $${strategy.entry_max.toFixed(2)})`);
       }
-    } else if (strategy.targets_hit === 2) {
-      if (isLong) {
-        if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
-          newTargetsHit = 3;
-          newStatus = 'completed';
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+    }
+
+    // ========================================================================
+    // CHECK TARGETS (only for in_position status)
+    // ========================================================================
+    if (strategy.status === 'in_position' || newStatus === 'in_position') {
+      if (strategy.targets_hit === 0) {
+        if (isLong) {
+          if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
+            newTargetsHit = 3;
+            newStatus = 'completed';
+            needsUpdate = true;
+            eventType = 'target_3';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
+          } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
+            newTargetsHit = 2;
+            needsUpdate = true;
+            eventType = 'target_2';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
+          } else if (currentPrice >= strategy.target_1 * (1 - this.EPSILON)) {
+            newTargetsHit = 1;
+            needsUpdate = true;
+            eventType = 'target_1';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
+          }
+        } else { // SHORT
+          if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
+            newTargetsHit = 3;
+            newStatus = 'completed';
+            needsUpdate = true;
+            eventType = 'target_3';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
+          } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
+            newTargetsHit = 2;
+            needsUpdate = true;
+            eventType = 'target_2';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
+          } else if (currentPrice <= strategy.target_1 * (1 + this.EPSILON)) {
+            newTargetsHit = 1;
+            needsUpdate = true;
+            eventType = 'target_1';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
+          }
         }
-      } else { // SHORT
-        if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
-          newTargetsHit = 3;
-          newStatus = 'completed';
-          needsUpdate = true;
-          console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+      } else if (strategy.targets_hit === 1) {
+        if (isLong) {
+          if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
+            newTargetsHit = 3;
+            newStatus = 'completed';
+            needsUpdate = true;
+            eventType = 'target_3';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+          } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
+            newTargetsHit = 2;
+            needsUpdate = true;
+            eventType = 'target_2';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
+          }
+        } else { // SHORT
+          if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
+            newTargetsHit = 3;
+            newStatus = 'completed';
+            needsUpdate = true;
+            eventType = 'target_3';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+          } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
+            newTargetsHit = 2;
+            needsUpdate = true;
+            eventType = 'target_2';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
+          }
+        }
+      } else if (strategy.targets_hit === 2) {
+        if (isLong) {
+          if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
+            newTargetsHit = 3;
+            newStatus = 'completed';
+            needsUpdate = true;
+            eventType = 'target_3';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+          }
+        } else { // SHORT
+          if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
+            newTargetsHit = 3;
+            newStatus = 'completed';
+            needsUpdate = true;
+            eventType = 'target_3';
+            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
+          }
         }
       }
     }
 
-    // Check stop loss
-    if (newStatus !== 'stopped' && newStatus !== 'completed') {
+    // ========================================================================
+    // CHECK STOP LOSS (for in_position status)
+    // ========================================================================
+    if ((strategy.status === 'in_position' || newStatus === 'in_position') && 
+        newStatus !== 'stopped' && newStatus !== 'completed') {
       if (isLong) {
         if (currentPrice <= strategy.stop_loss * (1 + this.EPSILON)) {
           newStatus = 'stopped';
           needsUpdate = true;
+          eventType = 'stop_loss';
           console.log(`[POSITION] ⚠️ ${strategy.symbol}: STOP LOSS HIT! $${currentPrice.toFixed(2)}`);
         }
       } else { // SHORT
         if (currentPrice >= strategy.stop_loss * (1 - this.EPSILON)) {
           newStatus = 'stopped';
           needsUpdate = true;
+          eventType = 'stop_loss';
           console.log(`[POSITION] ⚠️ ${strategy.symbol}: STOP LOSS HIT! $${currentPrice.toFixed(2)}`);
         }
       }
     }
 
+    // ========================================================================
+    // UPDATE DATABASE AND SEND NOTIFICATION
+    // ========================================================================
     if (needsUpdate) {
-      await this.updateStrategy(strategy.id, newTargetsHit, newStatus, currentPrice, strategy);
+      await this.updateStrategy(strategy.id, newTargetsHit, newStatus, currentPrice, strategy, eventType);
       
       // Update local copy
       strategy.targets_hit = newTargetsHit;
@@ -513,7 +562,7 @@ class PositionMonitor {
     }
   }
 
-  private async updateStrategy(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy) {
+  private async updateStrategy(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy, eventType: string) {
     try {
       const { data, error } = await supabase
         .from('active_strategies')
@@ -539,25 +588,17 @@ class PositionMonitor {
       console.log(`[POSITION] ✓ Database updated: targets_hit=${targetsHit}, status=${status}`);
       
       // Call Edge Function via HTTP
-      await this.notifyStrategyEvent(strategyId, targetsHit, status, currentPrice, strategy);
+      if (eventType) {
+        await this.notifyStrategyEvent(strategyId, targetsHit, status, currentPrice, strategy, eventType);
+      }
 
     } catch (error) {
       console.error(`[POSITION] Exception updating strategy:`, error);
     }
   }
 
-  private async notifyStrategyEvent(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy) {
+  private async notifyStrategyEvent(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy, eventType: string) {
     try {
-      let eventType = '';
-      
-      if (targetsHit > strategy.targets_hit) {
-        eventType = `target_${targetsHit}`;
-      } else if (status === 'stopped') {
-        eventType = 'stop_loss';
-      } else if (status === 'completed') {
-        eventType = 'completed';
-      }
-
       if (!eventType) return;
 
       const supabaseUrl = process.env.SUPABASE_URL;
@@ -575,6 +616,8 @@ class PositionMonitor {
           symbol: strategy.symbol,
           position_type: strategy.position_type,
           current_price: currentPrice,
+          entry_min: strategy.entry_min,
+          entry_max: strategy.entry_max,
           target_1: strategy.target_1,
           target_2: strategy.target_2,
           target_3: strategy.target_3,
@@ -588,7 +631,8 @@ class PositionMonitor {
       if (response.ok) {
         console.log(`[POSITION] ✓ Telegram notification sent: ${eventType}`);
       } else {
-        console.error(`[POSITION] Edge Function error: ${response.status}`);
+        const errorText = await response.text();
+        console.error(`[POSITION] Edge Function error: ${response.status} - ${errorText}`);
       }
     } catch (error) {
       console.error('[POSITION] Error calling Edge Function:', error);
@@ -609,6 +653,10 @@ class PositionMonitor {
     }
   }
 }
+
+// ============================================================================
+// BINANCE WEBSOCKET MANAGER
+// ============================================================================
 
 class BinanceMonitor {
   private ws: WebSocket | null = null;
@@ -897,7 +945,7 @@ class BinanceMonitor {
 
 async function main() {
   console.log('='.repeat(60));
-  console.log('CryptoMind AI - Monitoring Service v1.0.0');
+  console.log('CryptoMind AI - Monitoring Service v1.1.0');
   console.log('='.repeat(60));
 
   // Validate environment
@@ -928,6 +976,7 @@ async function main() {
 
   console.log('[MONITOR] Service running. Checking scanner status every 10 seconds...');
   console.log('[MONITOR] Note: Database trigger will automatically invoke analyze-full for new triggers');
+  console.log('[MONITOR] Note: Entry range notifications enabled for waiting_entry strategies');
 }
 
 // Start
