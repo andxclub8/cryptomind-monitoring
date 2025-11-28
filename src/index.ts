@@ -857,13 +857,14 @@ class BinanceMonitor {
         `${symbol.toLowerCase()}@ticker`
       ).join('/');
 
-      const wsUrl = `wss://data-stream.binance.vision/stream?streams=${streams}`;
+      // FUTURES WebSocket (not SPOT)
+      const wsUrl = `wss://fstream.binance.com/stream?streams=${streams}`;
       
-      console.log('[MONITOR] Connecting to Binance...');
+      console.log('[MONITOR] Connecting to Binance Futures WebSocket...');
       this.ws = new WebSocket(wsUrl);
 
       this.ws.on('open', () => {
-        console.log('[MONITOR] ✓ Connected to Binance WebSocket');
+        console.log('[MONITOR] ✓ Connected to Binance Futures WebSocket');
         console.log(`[MONITOR] ✓ Subscribed to ${this.monitoredSymbols.length} symbols`);
       });
 
@@ -945,7 +946,7 @@ class BinanceMonitor {
 
 async function main() {
   console.log('='.repeat(60));
-  console.log('CryptoMind AI - Monitoring Service v1.1.0');
+  console.log('CryptoMind AI - Monitoring Service v1.2.0');
   console.log('='.repeat(60));
 
   // Validate environment
@@ -975,6 +976,7 @@ async function main() {
   });
 
   console.log('[MONITOR] Service running. Checking scanner status every 10 seconds...');
+  console.log('[MONITOR] Note: Using Binance FUTURES data (fstream.binance.com)');
   console.log('[MONITOR] Note: Database trigger will automatically invoke analyze-full for new triggers');
   console.log('[MONITOR] Note: Entry range notifications enabled for waiting_entry strategies');
 }
