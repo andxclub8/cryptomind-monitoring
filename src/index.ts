@@ -810,7 +810,8 @@ class BinanceMonitor {
         return;
       }
       
-      const status = JSON.parse(data.value);
+      // Supabase returns jsonb already parsed - no JSON.parse needed
+      const status = data.value;
       
       if (status === 'running' && !this.isMonitoring) {
         console.log('[STATUS] Scanner starting...');
@@ -876,7 +877,8 @@ class BinanceMonitor {
         return [];
       }
       
-      const pairs = JSON.parse(data.value);
+      // Supabase returns jsonb already parsed - no JSON.parse needed
+      const pairs = Array.isArray(data.value) ? data.value : [];
       console.log(`[CONFIG] ✓ Loaded pairs: ${pairs.join(', ')}`);
       return pairs;
     } catch (error) {
