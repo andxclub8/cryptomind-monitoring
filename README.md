@@ -1,207 +1,191 @@
-# CryptoMind AI - Monitoring Service
+# CryptoMind AI - Railway Monitoring Service v3.2.0
 
-WebSocket monitoring service for real-time cryptocurrency market analysis and position tracking.
+Real-time cryptocurrency market monitoring service for CryptoMind AI trading system.
 
-## Features
+## What's New in v3.2.0
 
-### Scanner (Market Monitoring)
-- 24/7 WebSocket connection to Binance
-- Real-time volume spike detection
-- Real-time price move detection (5-min window)
-- Automatic baseline tracking
-- Triggers CryptoMind AI analysis on market events
+### ðŸ›¡ï¸ Circuit Breaker (Flash Crash Protection)
+- Detects extreme price movements (>5% in 15 minutes)
+- Automatically blocks new triggers for affected symbols
+- Sends Telegram alerts when activated
+- 30-minute cooldown before resuming
 
-### Position Monitor (NEW in v2.0)
-- Real-time tracking of active trading positions
-- Automatic target hit detection (T1, T2, T3)
-- Stop-loss monitoring
-- Price jump support (catches all targets at once)
-- Telegram notifications via Edge Function
-- Silent price updates (reduces database load)
+### ðŸ”§ Improved Reliability
+- Retry logic for database trigger invocations
+- Better error handling and logging
+- Performance index optimizations
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Binance WebSocket                         │
-│                  (Real-time @ticker data)                    │
-└────────────────┬────────────────────────────────────────────┘
-                 │
-                 ├──► Scanner (TriggerDetector)
-                 │    └──► monitoring_triggers → analyze-full → Telegram
-                 │
-                 └──► Position Monitor
-                      └──► Checks: T1/T2/T3, Stop-Loss
-                           └──► Updates active_strategies
-                                └──► HTTP → notify-strategy-event → Telegram
+â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+â”‚                     Railway Container                        â”‚
+â”‚                                                              â”‚
+â”‚  â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”     â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”               â”‚
+â”‚  â”‚  Scanner        â”‚     â”‚  Position       â”‚               â”‚
+â”‚  â”‚  Process        â”‚     â”‚  Monitor        â”‚               â”‚
+â”‚  â”‚                 â”‚     â”‚                 â”‚               â”‚
+â”‚  â”‚  â€¢ Volume spikesâ”‚     â”‚  â€¢ T1/T2/T3     â”‚               â”‚
+â”‚  â”‚  â€¢ Price moves  â”‚     â”‚  â€¢ Stop Loss    â”‚               â”‚
+â”‚  â”‚  â€¢ Circuit      â”‚     â”‚  â€¢ Telegram     â”‚               â”‚
+â”‚  â”‚    Breaker      â”‚     â”‚    notificationsâ”‚               â”‚
+â”‚  â””â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”˜     â””â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”˜               â”‚
+â”‚           â”‚                       â”‚                         â”‚
+â”‚           â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                         â”‚
+â”‚                       â”‚                                      â”‚
+â”‚           â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”                         â”‚
+â”‚           â”‚  Binance Futures      â”‚                         â”‚
+â”‚           â”‚  WebSocket            â”‚                         â”‚
+â”‚           â”‚  wss://fstream...     â”‚                         â”‚
+â”‚           â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜                         â”‚
+â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                        â”‚
+                        â–¼
+              â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+              â”‚    Supabase     â”‚
+              â”‚    Database     â”‚
+              â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
 
-## Two Parallel Processes
+## Features
 
-### 1. Scanner Process
-- Monitors: Volume spikes, Price moves
-- Creates: monitoring_triggers
-- Triggers: analyze-full (8 agents)
-- Output: Telegram signals with analysis
+### Scanner Process
+- **Volume Spike Detection**: Triggers when 24h volume exceeds 120% of baseline
+- **Price Movement Detection**: Triggers on >0.5% moves in 5-minute window
+- **Circuit Breaker**: Blocks triggers if price moves >5% in 15 minutes
+- **Dynamic Pair Management**: Reloads monitored pairs every 60 seconds
 
-### 2. Position Monitor Process
-- Monitors: Active positions (waiting_entry, in_position)
-- Checks: Target prices (T1/T2/T3), Stop-loss
-- Updates: active_strategies (targets_hit, status)
-- Calls: notify-strategy-event (HTTP)
-- Output: Telegram notifications (Target hit, Stop-loss hit)
-
-## Log Prefixes
-
-- `[CONFIG]` - Configuration loading
-- `[MONITOR]` - WebSocket connection status
-- `[TRIGGER]` - Scanner detections (volume/price)
-- `[POSITION]` - Position monitor events
-  - 🎯 - Target hit
-  - ⚠️ - Stop-loss hit
-  - ✓ - Success operations
+### Position Monitor
+- **Target Tracking**: Monitors T1, T2, T3 levels with 0.1% tolerance
+- **Stop Loss Monitoring**: Tracks stop loss for both LONG and SHORT positions
+- **Price Jump Handling**: Can detect multiple targets hit simultaneously
+- **Telegram Notifications**: Sends alerts via Edge Function
 
 ## Environment Variables
 
-Required:
-- `SUPABASE_URL` - Your Supabase project URL
-- `SUPABASE_ANON_KEY` - Your Supabase anon key
-
-## Database Integration
-
-### Reads From:
-- `system_config` (scanner_status, monitored_pairs)
-- `active_strategies` (for position monitoring)
-
-### Writes To:
-- `monitoring_triggers` (scanner detections)
-- `active_strategies` (position updates)
-
-### Calls:
-- `notify-strategy-event` Edge Function (HTTP POST)
-
-## Deployment on Railway
-
-1. Connect this repository to Railway
-2. Add environment variables:
-   - `SUPABASE_URL`
-   - `SUPABASE_ANON_KEY`
-3. Railway will automatically build and deploy
-
-## Local Development
+Required in Railway dashboard:
 
 ```bash
-npm install
-npm run dev
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=your_anon_key
 ```
 
-## Position Monitor Details
+## Deployment
 
-### Reload Interval
-- Reloads strategies every 15 seconds
-- Only logs changes (avoids spam)
-- Groups strategies by symbol
+### Automatic (Recommended)
+1. Push to `main` branch on GitHub
+2. Railway auto-detects changes
+3. Builds TypeScript â†’ JavaScript
+4. Restarts container
 
-### Price Checking
-- EPSILON: 0.1% tolerance (0.001)
-- Checks all targets simultaneously (supports price jumps)
-- Separate logic for LONG vs SHORT
+### Manual
+```bash
+# Build
+npm run build
 
-### Target Detection (LONG)
-```
-T1: price >= target_1 * 0.999
-T2: price >= target_2 * 0.999
-T3: price >= target_3 * 0.999
+# Start
+npm start
 ```
 
-### Target Detection (SHORT)
-```
-T1: price <= target_1 * 1.001
-T2: price <= target_2 * 1.001
-T3: price <= target_3 * 1.001
+## Database Requirements
+
+Before deploying v3.2.0, run the SQL migration:
+
+```sql
+-- See migrations/v3.2.0_circuit_breaker.sql
 ```
 
-### Stop-Loss Detection (LONG)
-```
-SL: price <= stop_loss * 1.001
-```
+This creates:
+- `circuit_breaker_state` table
+- Improved trigger function with retry logic
+- Performance indexes
 
-### Stop-Loss Detection (SHORT)
-```
-SL: price >= stop_loss * 0.999
-```
+## Configuration
 
-### Database Updates
-- `targets_hit`: Incremental (1 → 2 → 3)
-- `status`: Changes to 'completed' or 'stopped'
-- `current_price`: Always updated
-- `last_check_at`: Timestamp of check
+Settings are stored in `system_config` table:
 
-### HTTP Call to Edge Function
-```typescript
-POST {SUPABASE_URL}/functions/v1/notify-strategy-event
-Authorization: Bearer {SUPABASE_ANON_KEY}
-Body: {
-  strategy_id, event_type, symbol, position_type,
-  current_price, targets, stop_loss, status, label
+| Key | Default | Description |
+|-----|---------|-------------|
+| `scanner_status` | `"stopped"` | Scanner state ("running" or "stopped") |
+| `monitored_pairs` | `[]` | Array of pairs to monitor |
+| `volume_spike_threshold` | `1.20` | 120% of baseline triggers volume spike |
+| `price_move_threshold` | `0.005` | 0.5% triggers price movement |
+| `circuit_breaker_config` | `{...}` | Circuit breaker settings |
+
+### Circuit Breaker Config
+
+```json
+{
+  "threshold_percent": 5,
+  "window_minutes": 15,
+  "cooldown_minutes": 30
 }
 ```
 
-## Monitoring
+## Logs
 
-Service logs will show:
-- Connection status
-- Scanner detections ([TRIGGER])
-- Position updates ([POSITION])
-- Strategy loading ([POSITION])
-- Telegram notifications sent
+View logs in Railway dashboard â†’ Service â†’ Logs
 
-## Version
-
-2.0.0 - Added Position Monitor
-
-## Changes from v1.0
-
-- Added `PositionMonitor` class (~350 lines)
-- Added `ActiveStrategy` interface
-- Integrated with `BinanceMonitor`
-- Added HTTP calls to Edge Function
-- Added parallel monitoring processes
-- Improved logging with prefixes
-
-## Testing
-
-### Test Scanner:
-1. Wait for volume spike or price move
-2. Check logs: `[TRIGGER]` messages
-3. Check database: `monitoring_triggers` table
-4. Check Telegram: Signal received
-
-### Test Position Monitor:
-1. Create strategy via Dashboard
-2. Check logs: `[POSITION] Loaded X strategies`
-3. Wait for target hit
-4. Check logs: `[POSITION] 🎯 Target X HIT!`
-5. Check database: `targets_hit` updated
-6. Check Telegram: Notification received
+Log categories:
+- `[CONFIG]` - Configuration loading/changes
+- `[MONITOR]` - WebSocket status
+- `[TRIGGER]` - Trigger creation
+- `[CIRCUIT_BREAKER]` - Flash crash protection
+- `[POSITION_MONITOR]` - Strategy monitoring
 
 ## Troubleshooting
 
-**Position Monitor not loading strategies:**
-- Check `SUPABASE_URL` and `SUPABASE_ANON_KEY`
-- Check database has strategies with status 'waiting_entry' or 'in_position'
-- Check logs for `[POSITION]` messages
+### Service not starting
+1. Check environment variables in Railway dashboard
+2. Verify Supabase URL is accessible
+3. Check logs for connection errors
 
-**Targets not hitting:**
-- Check EPSILON value (0.001 = 0.1%)
-- Check price vs target in logs
-- Check strategy.position_type (LONG vs SHORT)
+### Triggers not creating
+1. Verify `scanner_status` is "running"
+2. Check `monitored_pairs` is not empty
+3. Look for circuit breaker blocks
+4. Check trigger cooldown (5 minutes per symbol/type)
 
-**Telegram not sending:**
-- Check Edge Function `notify-strategy-event` deployed
-- Check logs for HTTP errors
-- Check `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in Supabase
+### Circuit Breaker always active
+1. Check `circuit_breaker_state` table
+2. Run cleanup: `SELECT cleanup_expired_circuit_breakers();`
+3. Verify price data is correct
+
+### WebSocket disconnecting
+- Auto-reconnect after 5 seconds
+- Check Binance API status
+- Verify Railway outbound network
+
+## Version History
+
+### v3.2.0 (Current)
+- Added Circuit Breaker for flash crash protection
+- Improved trigger function with retry logic
+- Added performance indexes
+
+### v3.1.0
+- Added Position Monitor
+- Telegram notifications for targets
+- Dynamic pair management
+
+### v3.0.0
+- Initial Railway integration
+- Volume and price trigger detection
+- Database trigger architecture
+
+## Files
+
+```
+cryptomind-monitoring/
+â”œâ”€â”€ src/
+â”‚   â””â”€â”€ index.ts          # Main service (all-in-one)
+â”œâ”€â”€ migrations/
+â”‚   â””â”€â”€ v3.2.0_circuit_breaker.sql
+â”œâ”€â”€ package.json
+â”œâ”€â”€ tsconfig.json
+â””â”€â”€ README.md
+```
 
 ## License
 
-MIT
+Proprietary - CryptoMind AI
