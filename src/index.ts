@@ -1,176 +1,384 @@
+/**
+ * CryptoMind AI - Railway Monitoring Service v3.2.0
+ * 
+ * This service runs on Railway and handles:
+ * 1. Real-time market monitoring via Binance Futures WebSocket
+ * 2. Trigger detection (volume spikes, price movements)
+ * 3. Position monitoring for active strategies
+ * 4. Circuit Breaker for flash crash protection (NEW in v3.2.0)
+ * 
+ * Changes in v3.2.0:
+ * - Added Circuit Breaker (blocks triggers if price moves >5% in 15 min)
+ * - Added 15-minute price window tracking for flash crash detection
+ * - Telegram alerts for circuit breaker activation
+ * - Improved error handling and retry logic
+ */
+
 import WebSocket from 'ws';
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || '';
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-
+const CONFIG = {
+  // Supabase
+  SUPABASE_URL: process.env.SUPABASE_URL || '',
+  SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || '',
+  
+  // Binance WebSocket - FUTURES (not spot!)
+  BINANCE_WS_URL: 'wss://fstream.binance.com/stream',
+  
+  // Scanner settings
+  STATUS_CHECK_INTERVAL: 10000,      // 10 seconds
+  PAIR_RELOAD_INTERVAL: 60000,       // 60 seconds
+  VOLUME_BASELINE_UPDATE: 3600000,   // 1 hour
+  PRICE_WINDOW: 300000,              // 5 minutes for trigger detection
+  TRIGGER_COOLDOWN: 300000,          // 5 minutes cooldown
+  
+  // Thresholds (can be overridden from system_config)
+  VOLUME_SPIKE_THRESHOLD: 1.20,      // 120%
+  PRICE_MOVE_THRESHOLD: 0.005,       // 0.5%
+  
+  // Position Monitor
+  POSITION_RELOAD_INTERVAL: 15000,   // 15 seconds
+  EPSILON: 0.001,                    // 0.1% price tolerance
+  
+  // Circuit Breaker (NEW in v3.2.0)
+  CIRCUIT_BREAKER_WINDOW: 900000,    // 15 minutes
+  CIRCUIT_BREAKER_THRESHOLD: 0.05,   // 5% price change
+  CIRCUIT_BREAKER_COOLDOWN: 1800000, // 30 minutes block
+};
 
 // ============================================================================
-// INTERFACES
+// SUPABASE CLIENT
 // ============================================================================
+
+const supabase: SupabaseClient = createClient(
+  CONFIG.SUPABASE_URL,
+  CONFIG.SUPABASE_ANON_KEY
+);
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+interface TickerData {
+  stream: string;
+  data: {
+    s: string;    // Symbol
+    c: string;    // Close price
+    v: string;    // Volume
+    q: string;    // Quote volume
+    P: string;    // Price change percent
+  };
+}
+
+interface PricePoint {
+  price: number;
+  timestamp: number;
+}
 
 interface ActiveStrategy {
   id: string;
+  analysis_id: string;
   symbol: string;
-  position_type: 'LONG' | 'SHORT';
-  entry_min: number | null;
-  entry_max: number | null;
+  direction: 'LONG' | 'SHORT';
+  entry_min: number;
+  entry_max: number;
   target_1: number;
   target_2: number;
   target_3: number;
   stop_loss: number;
+  targets_hit: string[];
+  status: string;
   current_price: number;
-  targets_hit: number;
-  status: 'waiting_entry' | 'in_position' | 'paused' | 'completed' | 'stopped';
-  label: string | null;
-  started_at: string;
+}
+
+interface CircuitBreakerState {
+  symbol: string;
+  activatedAt: number;
+  expiresAt: number;
+  reason: string;
+  priceChangePercent: number;
 }
 
 // ============================================================================
-// CONFIGURATION HELPERS
-// ============================================================================
-
-async function getScannerStatus(): Promise<string> {
-  try {
-    const { data, error } = await supabase
-      .from('system_config')
-      .select('value')
-      .eq('key', 'scanner_status')
-      .single();
-    
-    if (error || !data) {
-      return 'stopped';
-    }
-    
-    return data.value;
-  } catch (err) {
-    console.error('[CONFIG] Error loading scanner_status:', err);
-    return 'stopped';
-  }
-}
-
-async function loadMonitoredPairs(): Promise<string[]> {
-  try {
-    const { data, error } = await supabase
-      .from('system_config')
-      .select('value')
-      .eq('key', 'monitored_pairs')
-      .single();
-    
-    if (error) {
-      console.error('[CONFIG] Error loading monitored_pairs:', error.message);
-      return [];
-    }
-    
-    if (!data || !data.value) {
-      console.warn('[CONFIG] No monitored_pairs in database');
-      return [];
-    }
-    
-    // Handle both string and already-parsed JSON (jsonb type)
-    const pairs = typeof data.value === 'string' 
-      ? JSON.parse(data.value) 
-      : data.value;
-    
-    if (!Array.isArray(pairs)) {
-      console.error('[CONFIG] monitored_pairs is not an array:', pairs);
-      return [];
-    }
-    
-    if (pairs.length === 0) {
-      console.warn('[CONFIG] Monitored pairs array is empty');
-      return [];
-    }
-    
-    console.log('[CONFIG] ✓ Loaded monitored pairs:', pairs.join(', '));
-    return pairs;
-    
-  } catch (err) {
-    console.error('[CONFIG] Exception loading monitored pairs:', err);
-    return [];
-  }
-}
-
-// ============================================================================
-// BASELINE TRACKER
+// BASELINE TRACKER (Volume)
 // ============================================================================
 
 class BaselineTracker {
   private baselines: Map<string, number> = new Map();
   private lastUpdate: Map<string, number> = new Map();
-  private readonly UPDATE_INTERVAL = 3600000; // 1 hour
-
-  initialize(symbol: string, volume: number) {
+  
+  initialize(symbol: string, volume: number): void {
     if (!this.baselines.has(symbol)) {
       this.baselines.set(symbol, volume);
       this.lastUpdate.set(symbol, Date.now());
-      console.log(`[Baseline] Initialized for ${symbol}: ${volume.toFixed(0)}`);
+      console.log(`[Baseline] Initialized ${symbol}: ${volume.toFixed(2)}`);
     }
   }
-
-  update(symbol: string, currentVolume: number) {
-    const lastUpdate = this.lastUpdate.get(symbol) || 0;
-    const timeSinceUpdate = Date.now() - lastUpdate;
-
-    if (timeSinceUpdate > this.UPDATE_INTERVAL) {
+  
+  update(symbol: string, currentVolume: number): void {
+    const lastUpdateTime = this.lastUpdate.get(symbol) || 0;
+    
+    if (Date.now() - lastUpdateTime >= CONFIG.VOLUME_BASELINE_UPDATE) {
       const oldBaseline = this.baselines.get(symbol) || currentVolume;
       const newBaseline = oldBaseline * 0.8 + currentVolume * 0.2;
       this.baselines.set(symbol, newBaseline);
       this.lastUpdate.set(symbol, Date.now());
-      console.log(`[Baseline] Updated ${symbol}: ${oldBaseline.toFixed(0)} → ${newBaseline.toFixed(0)}`);
+      console.log(`[Baseline] Updated ${symbol}: ${oldBaseline.toFixed(2)} → ${newBaseline.toFixed(2)}`);
     }
   }
-
-  get(symbol: string): number {
+  
+  check(symbol: string, currentVolume: number, threshold: number): { isSpike: boolean; ratio: number } {
+    const baseline = this.baselines.get(symbol);
+    if (!baseline) return { isSpike: false, ratio: 0 };
+    
+    const ratio = currentVolume / baseline;
+    return { isSpike: ratio > threshold, ratio };
+  }
+  
+  getBaseline(symbol: string): number {
     return this.baselines.get(symbol) || 0;
   }
-
-  clear() {
+  
+  clear(): void {
     this.baselines.clear();
     this.lastUpdate.clear();
   }
 }
 
 // ============================================================================
-// PRICE HISTORY TRACKER
+// PRICE HISTORY TRACKER (5-minute window for triggers)
 // ============================================================================
 
 class PriceHistoryTracker {
-  private history: Map<string, Array<{ price: number; timestamp: number }>> = new Map();
-  private readonly WINDOW = 300000; // 5 minutes
-
-  add(symbol: string, price: number) {
+  private history: Map<string, PricePoint[]> = new Map();
+  
+  add(symbol: string, price: number): void {
     if (!this.history.has(symbol)) {
       this.history.set(symbol, []);
     }
-
-    const history = this.history.get(symbol)!;
-    const now = Date.now();
-
-    // Add new price
-    history.push({ price, timestamp: now });
-
-    // Remove old prices (> 5 min)
-    const filtered = history.filter(h => now - h.timestamp <= this.WINDOW);
+    
+    const points = this.history.get(symbol)!;
+    points.push({ price, timestamp: Date.now() });
+    
+    // Cleanup old points
+    this.cleanup(symbol);
+  }
+  
+  private cleanup(symbol: string): void {
+    const points = this.history.get(symbol);
+    if (!points) return;
+    
+    const cutoff = Date.now() - CONFIG.PRICE_WINDOW;
+    const filtered = points.filter(p => p.timestamp > cutoff);
     this.history.set(symbol, filtered);
   }
-
+  
   getChange(symbol: string, currentPrice: number): number {
-    const history = this.history.get(symbol);
-    if (!history || history.length === 0) return 0;
-
-    const oldestPrice = history[0].price;
+    const points = this.history.get(symbol);
+    if (!points || points.length === 0) return 0;
+    
+    const oldestPrice = points[0].price;
     return ((currentPrice - oldestPrice) / oldestPrice) * 100;
   }
-
-  clear() {
+  
+  check(symbol: string, currentPrice: number, threshold: number): { isTrigger: boolean; change: number } {
+    const change = Math.abs(this.getChange(symbol, currentPrice));
+    return { isTrigger: change >= threshold * 100, change };
+  }
+  
+  clear(): void {
     this.history.clear();
+  }
+}
+
+// ============================================================================
+// CIRCUIT BREAKER (NEW in v3.2.0)
+// ============================================================================
+
+class CircuitBreaker {
+  // 15-minute price history for flash crash detection
+  private priceHistory15m: Map<string, PricePoint[]> = new Map();
+  
+  // Active circuit breaker states
+  private activeBreakers: Map<string, CircuitBreakerState> = new Map();
+  
+  /**
+   * Add price point and check for circuit breaker trigger
+   */
+  addPrice(symbol: string, price: number): { shouldBlock: boolean; reason?: string } {
+    // Add to 15-minute history
+    if (!this.priceHistory15m.has(symbol)) {
+      this.priceHistory15m.set(symbol, []);
+    }
+    
+    const points = this.priceHistory15m.get(symbol)!;
+    points.push({ price, timestamp: Date.now() });
+    
+    // Cleanup old points (older than 15 minutes)
+    const cutoff = Date.now() - CONFIG.CIRCUIT_BREAKER_WINDOW;
+    const filtered = points.filter(p => p.timestamp > cutoff);
+    this.priceHistory15m.set(symbol, filtered);
+    
+    // Check if circuit breaker is currently active
+    const activeBreaker = this.activeBreakers.get(symbol);
+    if (activeBreaker && Date.now() < activeBreaker.expiresAt) {
+      return { 
+        shouldBlock: true, 
+        reason: `Circuit breaker active until ${new Date(activeBreaker.expiresAt).toISOString()}` 
+      };
+    } else if (activeBreaker && Date.now() >= activeBreaker.expiresAt) {
+      // Expired - remove it
+      this.activeBreakers.delete(symbol);
+      console.log(`[CIRCUIT_BREAKER] ✓ Expired for ${symbol}, resuming normal operation`);
+    }
+    
+    // Check for flash crash (>5% in 15 minutes)
+    if (filtered.length >= 2) {
+      const oldestPrice = filtered[0].price;
+      const priceChange = ((price - oldestPrice) / oldestPrice);
+      const priceChangePercent = priceChange * 100;
+      
+      if (Math.abs(priceChange) >= CONFIG.CIRCUIT_BREAKER_THRESHOLD) {
+        // FLASH CRASH DETECTED!
+        const direction = priceChange > 0 ? 'UP' : 'DOWN';
+        const reason = `Flash ${direction}: ${priceChangePercent.toFixed(2)}% in 15 minutes`;
+        
+        console.log(`[CIRCUIT_BREAKER] ⚠️ ACTIVATED for ${symbol}: ${reason}`);
+        
+        // Activate circuit breaker
+        const state: CircuitBreakerState = {
+          symbol,
+          activatedAt: Date.now(),
+          expiresAt: Date.now() + CONFIG.CIRCUIT_BREAKER_COOLDOWN,
+          reason,
+          priceChangePercent
+        };
+        
+        this.activeBreakers.set(symbol, state);
+        
+        // Log to database and send Telegram (async, don't await)
+        this.logCircuitBreaker(state);
+        
+        return { shouldBlock: true, reason };
+      }
+    }
+    
+    return { shouldBlock: false };
+  }
+  
+  /**
+   * Check if symbol is currently blocked
+   */
+  isBlocked(symbol: string): boolean {
+    const activeBreaker = this.activeBreakers.get(symbol);
+    if (!activeBreaker) return false;
+    
+    if (Date.now() >= activeBreaker.expiresAt) {
+      this.activeBreakers.delete(symbol);
+      return false;
+    }
+    
+    return true;
+  }
+  
+  /**
+   * Log circuit breaker activation to database and send Telegram
+   */
+  private async logCircuitBreaker(state: CircuitBreakerState): Promise<void> {
+    try {
+      // Insert into circuit_breaker_state table
+      await supabase.from('circuit_breaker_state').insert({
+        symbol: state.symbol,
+        activated_at: new Date(state.activatedAt).toISOString(),
+        expires_at: new Date(state.expiresAt).toISOString(),
+        reason: state.reason,
+        price_change_percent: state.priceChangePercent,
+        is_active: true
+      });
+      
+      // Log to system_logs
+      await supabase.from('system_logs').insert({
+        level: 'WARN',
+        category: 'CircuitBreaker',
+        message: `Circuit breaker activated for ${state.symbol}`,
+        metadata: {
+          symbol: state.symbol,
+          reason: state.reason,
+          priceChangePercent: state.priceChangePercent,
+          expiresAt: new Date(state.expiresAt).toISOString()
+        },
+        source: 'Railway'
+      });
+      
+      // Send Telegram alert via Edge Function
+      await this.sendTelegramAlert(state);
+      
+    } catch (error) {
+      console.error('[CIRCUIT_BREAKER] Failed to log:', error);
+    }
+  }
+  
+  /**
+   * Send Telegram alert for circuit breaker activation
+   */
+  private async sendTelegramAlert(state: CircuitBreakerState): Promise<void> {
+    try {
+      const response = await fetch(
+        `${CONFIG.SUPABASE_URL}/functions/v1/telegram-bot`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            action: 'send_circuit_breaker_alert',
+            data: {
+              symbol: state.symbol,
+              reason: state.reason,
+              priceChangePercent: state.priceChangePercent,
+              expiresAt: new Date(state.expiresAt).toISOString(),
+              cooldownMinutes: CONFIG.CIRCUIT_BREAKER_COOLDOWN / 60000
+            }
+          })
+        }
+      );
+      
+      if (!response.ok) {
+        console.error('[CIRCUIT_BREAKER] Telegram alert failed:', response.status);
+      } else {
+        console.log('[CIRCUIT_BREAKER] ✓ Telegram alert sent');
+      }
+    } catch (error) {
+      console.error('[CIRCUIT_BREAKER] Telegram error:', error);
+    }
+  }
+  
+  /**
+   * Get all active circuit breakers
+   */
+  getActiveBreakers(): CircuitBreakerState[] {
+    const now = Date.now();
+    const active: CircuitBreakerState[] = [];
+    
+    this.activeBreakers.forEach((state, symbol) => {
+      if (now < state.expiresAt) {
+        active.push(state);
+      } else {
+        this.activeBreakers.delete(symbol);
+      }
+    });
+    
+    return active;
+  }
+  
+  clear(): void {
+    this.priceHistory15m.clear();
+    this.activeBreakers.clear();
   }
 }
 
@@ -179,107 +387,149 @@ class PriceHistoryTracker {
 // ============================================================================
 
 class TriggerDetector {
-  private baselineTracker = new BaselineTracker();
-  private priceHistory = new PriceHistoryTracker();
   private recentTriggers: Map<string, number> = new Map();
-  private readonly TRIGGER_COOLDOWN = 300000; // 5 minute (lowered for testing)
-
-  async checkVolumeTrigger(symbol: string, tickerData: any) {
-    const currentVolume = parseFloat(tickerData.q); // 24h quote volume
-
-    // Initialize baseline
-    this.baselineTracker.initialize(symbol, currentVolume);
-
-    // Update baseline
-    this.baselineTracker.update(symbol, currentVolume);
-
-    // Check trigger
-    const baseline = this.baselineTracker.get(symbol);
-    const volumeRatio = currentVolume / baseline;
-
-    const volumeThreshold = 1.20; // 120% (lowered for testing)
-
-    if (volumeRatio > volumeThreshold) {
-      await this.createTrigger(symbol, 'volume_spike', volumeRatio, volumeThreshold, {
-        currentVolume: currentVolume.toFixed(0),
-        baseline: baseline.toFixed(0),
-        ratio: volumeRatio.toFixed(2)
-      });
-    }
+  private baselineTracker: BaselineTracker;
+  private priceTracker: PriceHistoryTracker;
+  private circuitBreaker: CircuitBreaker;
+  
+  // Thresholds (loaded from config)
+  private volumeThreshold: number = CONFIG.VOLUME_SPIKE_THRESHOLD;
+  private priceThreshold: number = CONFIG.PRICE_MOVE_THRESHOLD;
+  
+  constructor() {
+    this.baselineTracker = new BaselineTracker();
+    this.priceTracker = new PriceHistoryTracker();
+    this.circuitBreaker = new CircuitBreaker();
   }
-
-  async checkPriceTrigger(symbol: string, tickerData: any) {
-    const currentPrice = parseFloat(tickerData.c);
-
-    // Add to history
-    this.priceHistory.add(symbol, currentPrice);
-
-    // Calculate 5-min change
-    const priceChange = this.priceHistory.getChange(symbol, currentPrice);
-
-    const priceThreshold = 0.5; // 0.5% (lowered for testing)
-
-    if (Math.abs(priceChange) >= priceThreshold) {
-      await this.createTrigger(symbol, 'price_move', priceChange, priceThreshold, {
-        priceChange5min: priceChange.toFixed(2),
-        currentPrice: currentPrice.toFixed(6)
-      });
-    }
-  }
-
-  async createTrigger(
-    symbol: string,
-    type: string,
-    value: number,
-    threshold: number,
-    metadata: any
-  ) {
-    // Check cooldown
-    const lastTrigger = this.recentTriggers.get(`${symbol}-${type}`) || 0;
-    if (Date.now() - lastTrigger < this.TRIGGER_COOLDOWN) {
-      return; // Skip, too soon
-    }
-
-    console.log(`[TRIGGER] ${type} detected for ${symbol}: ${value.toFixed(2)} (threshold: ${threshold})`);
-
-    // Record trigger
-    this.recentTriggers.set(`${symbol}-${type}`, Date.now());
-
-    // Save to database - Database Trigger will automatically invoke analyze-full
+  
+  async loadThresholds(): Promise<void> {
     try {
-      console.log(`[TRIGGER] Creating trigger record in database...`);
+      const { data, error } = await supabase
+        .from('system_config')
+        .select('key, value')
+        .in('key', ['volume_spike_threshold', 'price_move_threshold']);
       
-      const { data: triggerData, error: insertError } = await supabase
+      if (data) {
+        for (const config of data) {
+          if (config.key === 'volume_spike_threshold') {
+            this.volumeThreshold = parseFloat(config.value) || CONFIG.VOLUME_SPIKE_THRESHOLD;
+          }
+          if (config.key === 'price_move_threshold') {
+            this.priceThreshold = parseFloat(config.value) || CONFIG.PRICE_MOVE_THRESHOLD;
+          }
+        }
+      }
+      
+      console.log(`[CONFIG] Thresholds: volume=${this.volumeThreshold}, price=${this.priceThreshold}`);
+    } catch (error) {
+      console.error('[CONFIG] Failed to load thresholds:', error);
+    }
+  }
+  
+  async processTicker(ticker: TickerData['data']): Promise<void> {
+    const symbol = ticker.s;
+    const price = parseFloat(ticker.c);
+    const volume = parseFloat(ticker.q); // Quote volume in USDT
+    
+    // Initialize baseline if needed
+    this.baselineTracker.initialize(symbol, volume);
+    
+    // Update baseline periodically
+    this.baselineTracker.update(symbol, volume);
+    
+    // Add to price trackers
+    this.priceTracker.add(symbol, price);
+    
+    // Check circuit breaker (15-minute window)
+    const circuitCheck = this.circuitBreaker.addPrice(symbol, price);
+    if (circuitCheck.shouldBlock) {
+      // Circuit breaker is active - skip trigger detection
+      return;
+    }
+    
+    // Check for volume spike
+    const volumeCheck = this.baselineTracker.check(symbol, volume, this.volumeThreshold);
+    if (volumeCheck.isSpike) {
+      await this.createTrigger(symbol, 'volume_spike', volumeCheck.ratio, {
+        baseline: this.baselineTracker.getBaseline(symbol),
+        currentVolume: volume,
+        ratio: volumeCheck.ratio
+      });
+    }
+    
+    // Check for price movement
+    const priceCheck = this.priceTracker.check(symbol, price, this.priceThreshold);
+    if (priceCheck.isTrigger) {
+      await this.createTrigger(symbol, 'price_move', priceCheck.change, {
+        priceChange: priceCheck.change,
+        currentPrice: price
+      });
+    }
+  }
+  
+  private async createTrigger(
+    symbol: string, 
+    type: string, 
+    value: number, 
+    metadata: Record<string, any>
+  ): Promise<void> {
+    // Check cooldown
+    const key = `${symbol}-${type}`;
+    const lastTrigger = this.recentTriggers.get(key) || 0;
+    
+    if (Date.now() - lastTrigger < CONFIG.TRIGGER_COOLDOWN) {
+      return; // Skip - too soon
+    }
+    
+    // Double-check circuit breaker before creating trigger
+    if (this.circuitBreaker.isBlocked(symbol)) {
+      console.log(`[TRIGGER] Blocked by circuit breaker: ${symbol}`);
+      return;
+    }
+    
+    // Record trigger time
+    this.recentTriggers.set(key, Date.now());
+    
+    try {
+      // Create trigger in database
+      const { data, error } = await supabase
         .from('monitoring_triggers')
         .insert({
           symbol,
           trigger_type: type,
           trigger_value: value.toFixed(3),
-          threshold_used: threshold.toString(),
+          threshold_used: type === 'volume_spike' 
+            ? this.volumeThreshold.toString() 
+            : this.priceThreshold.toString(),
           metadata,
-          analysis_started: false  // Database trigger will update this
+          analysis_started: false
         })
-        .select()
+        .select('id')
         .single();
-
-      if (insertError || !triggerData) {
-        console.error('[TRIGGER] Database error:', insertError?.message);
+      
+      if (error) {
+        console.error(`[TRIGGER] Database error:`, error.message);
         return;
       }
-
-      const triggerId = triggerData.id;
-      console.log(`[TRIGGER] ✓ Trigger record created with ID: ${triggerId}`);
-      console.log(`[TRIGGER] → Database trigger will automatically invoke analyze-full`);
-
-    } catch (err) {
-      console.error('[TRIGGER] Exception in createTrigger:', err);
+      
+      console.log(`[TRIGGER] ✓ Created ${type} for ${symbol}: ${value.toFixed(2)}%`);
+      console.log(`[TRIGGER] → ID: ${data.id}`);
+      console.log(`[TRIGGER] → Database trigger will invoke analyze-full`);
+      
+    } catch (error) {
+      console.error(`[TRIGGER] Error creating trigger:`, error);
     }
   }
-
-  reset() {
-    this.baselineTracker.clear();
-    this.priceHistory.clear();
+  
+  getCircuitBreaker(): CircuitBreaker {
+    return this.circuitBreaker;
+  }
+  
+  clear(): void {
     this.recentTriggers.clear();
+    this.baselineTracker.clear();
+    this.priceTracker.clear();
+    this.circuitBreaker.clear();
   }
 }
 
@@ -288,701 +538,493 @@ class TriggerDetector {
 // ============================================================================
 
 class PositionMonitor {
-  private activeStrategies: Map<string, ActiveStrategy[]> = new Map();
-  private reloadTimer: NodeJS.Timeout | null = null;
-  private lastReloadTime: number = 0;
-  private readonly RELOAD_INTERVAL = 15000; // 15 seconds
-  private readonly EPSILON = 0.001; // 0.1% tolerance for price matching
+  private strategies: Map<string, ActiveStrategy[]> = new Map();
+  private latestPrices: Map<string, number> = new Map();
+  private reloadInterval: NodeJS.Timeout | null = null;
   private isActive: boolean = false;
-
-  async start() {
-    console.log('[POSITION] Position monitor starting...');
-    this.isActive = true;
-    await this.loadActiveStrategies();
-    this.scheduleReload();
-    console.log('[POSITION] ✓ Position monitor started');
-  }
-
-  stop() {
-    console.log('[POSITION] Stopping position monitor...');
-    this.isActive = false;
-    if (this.reloadTimer) {
-      clearInterval(this.reloadTimer);
-      this.reloadTimer = null;
-    }
-    this.activeStrategies.clear();
-    console.log('[POSITION] ✓ Position monitor stopped');
-  }
-
-  private scheduleReload() {
-    if (this.reloadTimer) clearInterval(this.reloadTimer);
+  
+  async start(): Promise<void> {
+    if (this.isActive) return;
     
-    this.reloadTimer = setInterval(async () => {
-      if (this.isActive) {
-        await this.loadActiveStrategies();
-      }
-    }, this.RELOAD_INTERVAL);
+    this.isActive = true;
+    console.log('[POSITION_MONITOR] ✓ Started');
+    
+    // Initial load
+    await this.loadStrategies();
+    
+    // Reload every 15 seconds
+    this.reloadInterval = setInterval(async () => {
+      await this.loadStrategies();
+    }, CONFIG.POSITION_RELOAD_INTERVAL);
   }
-
-  private async loadActiveStrategies() {
+  
+  stop(): void {
+    if (this.reloadInterval) {
+      clearInterval(this.reloadInterval);
+      this.reloadInterval = null;
+    }
+    this.strategies.clear();
+    this.isActive = false;
+    console.log('[POSITION_MONITOR] ✓ Stopped');
+  }
+  
+  private async loadStrategies(): Promise<void> {
     try {
-      const now = Date.now();
-      
-      // Only log reload every minute to avoid spam
-      if (now - this.lastReloadTime > 60000) {
-        console.log('[POSITION] Reloading active strategies...');
-        this.lastReloadTime = now;
-      }
-      
       const { data, error } = await supabase
         .from('active_strategies')
         .select('*')
-        .in('status', ['waiting_entry', 'in_position'])
-        .order('started_at', { ascending: false });
-
+        .in('status', ['waiting_entry', 'in_position']);
+      
       if (error) {
-        console.error('[POSITION] Error loading strategies:', error.message);
+        console.error('[POSITION_MONITOR] Load error:', error.message);
         return;
       }
-
-      // Group strategies by symbol
-      const strategiesBySymbol = new Map<string, ActiveStrategy[]>();
       
-      if (data && data.length > 0) {
-        for (const strategy of data as ActiveStrategy[]) {
-          const symbol = strategy.symbol;
-          if (!strategiesBySymbol.has(symbol)) {
-            strategiesBySymbol.set(symbol, []);
-          }
-          strategiesBySymbol.get(symbol)!.push(strategy);
+      // Group by symbol
+      this.strategies.clear();
+      for (const strategy of (data || [])) {
+        const symbol = strategy.symbol;
+        if (!this.strategies.has(symbol)) {
+          this.strategies.set(symbol, []);
         }
-        
-        // Only log when symbols change
-        const symbolsChanged = 
-          strategiesBySymbol.size !== this.activeStrategies.size ||
-          ![...strategiesBySymbol.keys()].every(k => this.activeStrategies.has(k));
-        
-        if (symbolsChanged) {
-          console.log(`[POSITION] ✓ Loaded ${data.length} active strategies across ${strategiesBySymbol.size} symbols`);
-          console.log('[POSITION] Symbols:', [...strategiesBySymbol.keys()].join(', '));
-        }
-      } else if (this.activeStrategies.size > 0) {
-        console.log('[POSITION] No active strategies to monitor');
+        this.strategies.get(symbol)!.push(strategy);
       }
-
-      this.activeStrategies = strategiesBySymbol;
+      
+      const totalStrategies = data?.length || 0;
+      if (totalStrategies > 0) {
+        console.log(`[POSITION_MONITOR] Loaded ${totalStrategies} strategies for ${this.strategies.size} symbols`);
+      }
+      
     } catch (error) {
-      console.error('[POSITION] Exception loading strategies:', error);
+      console.error('[POSITION_MONITOR] Load error:', error);
     }
   }
-
-  checkPrice(symbol: string, currentPrice: number) {
-    const strategies = this.activeStrategies.get(symbol);
+  
+  /**
+   * Called on each ticker update
+   */
+  async checkPrice(symbol: string, price: number): Promise<void> {
+    this.latestPrices.set(symbol, price);
+    
+    const strategies = this.strategies.get(symbol);
     if (!strategies || strategies.length === 0) return;
-
+    
     for (const strategy of strategies) {
-      this.checkStrategy(strategy, currentPrice);
+      await this.checkStrategy(strategy, price);
     }
   }
-
-  private async checkStrategy(strategy: ActiveStrategy, currentPrice: number) {
-    const isLong = strategy.position_type === 'LONG';
-    let needsUpdate = false;
-    let newTargetsHit = strategy.targets_hit;
-    let newStatus = strategy.status;
-    let eventType = '';
-
-    // ========================================================================
-    // CHECK ENTRY RANGE (for waiting_entry status)
-    // ========================================================================
-    if (strategy.status === 'waiting_entry' && strategy.entry_min && strategy.entry_max) {
-      let entryReached = false;
+  
+  private async checkStrategy(strategy: ActiveStrategy, currentPrice: number): Promise<void> {
+    const isLong = strategy.direction === 'LONG';
+    const targetsHit = new Set(strategy.targets_hit || []);
+    let hasUpdate = false;
+    let eventType: string | null = null;
+    
+    // Check targets (T3 → T2 → T1 for price jumps)
+    const targets = [
+      { name: 'target_3', value: strategy.target_3 },
+      { name: 'target_2', value: strategy.target_2 },
+      { name: 'target_1', value: strategy.target_1 }
+    ];
+    
+    for (const target of targets) {
+      if (targetsHit.has(target.name)) continue;
       
-      if (isLong) {
-        // For LONG: price dropped into entry zone (at or below entry_max)
-        if (currentPrice <= strategy.entry_max) {
-          entryReached = true;
-        }
-      } else {
-        // For SHORT: price rose into entry zone (at or above entry_min)
-        if (currentPrice >= strategy.entry_min) {
-          entryReached = true;
-        }
-      }
+      const hit = isLong
+        ? currentPrice >= target.value * (1 - CONFIG.EPSILON)
+        : currentPrice <= target.value * (1 + CONFIG.EPSILON);
       
-      if (entryReached) {
-        newStatus = 'in_position';
-        needsUpdate = true;
-        eventType = 'entry_reached';
-        console.log(`[POSITION] 🎯 ${strategy.symbol}: ENTRY ZONE REACHED! $${currentPrice.toFixed(2)} (range: $${strategy.entry_min.toFixed(2)} - $${strategy.entry_max.toFixed(2)})`);
+      if (hit) {
+        targetsHit.add(target.name);
+        hasUpdate = true;
+        eventType = target.name;
+        console.log(`[POSITION_MONITOR] 🎯 ${target.name.toUpperCase()} hit for ${strategy.symbol}!`);
       }
     }
-
-    // ========================================================================
-    // CHECK TARGETS (only for in_position status)
-    // ========================================================================
-    if (strategy.status === 'in_position' || newStatus === 'in_position') {
-      if (strategy.targets_hit === 0) {
-        if (isLong) {
-          if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
-            newTargetsHit = 3;
-            newStatus = 'completed';
-            needsUpdate = true;
-            eventType = 'target_3';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
-          } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
-            newTargetsHit = 2;
-            needsUpdate = true;
-            eventType = 'target_2';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
-          } else if (currentPrice >= strategy.target_1 * (1 - this.EPSILON)) {
-            newTargetsHit = 1;
-            needsUpdate = true;
-            eventType = 'target_1';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
-          }
-        } else { // SHORT
-          if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
-            newTargetsHit = 3;
-            newStatus = 'completed';
-            needsUpdate = true;
-            eventType = 'target_3';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: ALL TARGETS HIT! $${currentPrice.toFixed(2)}`);
-          } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
-            newTargetsHit = 2;
-            needsUpdate = true;
-            eventType = 'target_2';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 & 2 HIT! $${currentPrice.toFixed(2)}`);
-          } else if (currentPrice <= strategy.target_1 * (1 + this.EPSILON)) {
-            newTargetsHit = 1;
-            needsUpdate = true;
-            eventType = 'target_1';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 1 HIT! $${currentPrice.toFixed(2)}`);
-          }
-        }
-      } else if (strategy.targets_hit === 1) {
-        if (isLong) {
-          if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
-            newTargetsHit = 3;
-            newStatus = 'completed';
-            needsUpdate = true;
-            eventType = 'target_3';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
-          } else if (currentPrice >= strategy.target_2 * (1 - this.EPSILON)) {
-            newTargetsHit = 2;
-            needsUpdate = true;
-            eventType = 'target_2';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
-          }
-        } else { // SHORT
-          if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
-            newTargetsHit = 3;
-            newStatus = 'completed';
-            needsUpdate = true;
-            eventType = 'target_3';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
-          } else if (currentPrice <= strategy.target_2 * (1 + this.EPSILON)) {
-            newTargetsHit = 2;
-            needsUpdate = true;
-            eventType = 'target_2';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 2 HIT! $${currentPrice.toFixed(2)}`);
-          }
-        }
-      } else if (strategy.targets_hit === 2) {
-        if (isLong) {
-          if (currentPrice >= strategy.target_3 * (1 - this.EPSILON)) {
-            newTargetsHit = 3;
-            newStatus = 'completed';
-            needsUpdate = true;
-            eventType = 'target_3';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
-          }
-        } else { // SHORT
-          if (currentPrice <= strategy.target_3 * (1 + this.EPSILON)) {
-            newTargetsHit = 3;
-            newStatus = 'completed';
-            needsUpdate = true;
-            eventType = 'target_3';
-            console.log(`[POSITION] 🎯 ${strategy.symbol}: Target 3 HIT! $${currentPrice.toFixed(2)}`);
-          }
-        }
-      }
+    
+    // Check stop loss
+    const stopLossHit = isLong
+      ? currentPrice <= strategy.stop_loss * (1 + CONFIG.EPSILON)
+      : currentPrice >= strategy.stop_loss * (1 - CONFIG.EPSILON);
+    
+    if (stopLossHit && !targetsHit.has('stop_loss')) {
+      targetsHit.add('stop_loss');
+      hasUpdate = true;
+      eventType = 'stop_loss';
+      console.log(`[POSITION_MONITOR] 🛑 STOP LOSS hit for ${strategy.symbol}!`);
     }
-
-    // ========================================================================
-    // CHECK STOP LOSS (for in_position status)
-    // ========================================================================
-    if ((strategy.status === 'in_position' || newStatus === 'in_position') && 
-        newStatus !== 'stopped' && newStatus !== 'completed') {
-      if (isLong) {
-        if (currentPrice <= strategy.stop_loss * (1 + this.EPSILON)) {
-          newStatus = 'stopped';
-          needsUpdate = true;
-          eventType = 'stop_loss';
-          console.log(`[POSITION] ⚠️ ${strategy.symbol}: STOP LOSS HIT! $${currentPrice.toFixed(2)}`);
-        }
-      } else { // SHORT
-        if (currentPrice >= strategy.stop_loss * (1 - this.EPSILON)) {
-          newStatus = 'stopped';
-          needsUpdate = true;
-          eventType = 'stop_loss';
-          console.log(`[POSITION] ⚠️ ${strategy.symbol}: STOP LOSS HIT! $${currentPrice.toFixed(2)}`);
-        }
-      }
-    }
-
-    // ========================================================================
-    // UPDATE DATABASE AND SEND NOTIFICATION
-    // ========================================================================
-    if (needsUpdate) {
-      await this.updateStrategy(strategy.id, newTargetsHit, newStatus, currentPrice, strategy, eventType);
+    
+    // Update database if something changed
+    if (hasUpdate) {
+      const newStatus = targetsHit.has('target_3') || targetsHit.has('stop_loss')
+        ? 'completed'
+        : 'in_position';
       
-      // Update local copy
-      strategy.targets_hit = newTargetsHit;
-      strategy.status = newStatus;
-      strategy.current_price = currentPrice;
-      
-      // Remove from monitoring if completed or stopped
-      if (newStatus === 'completed' || newStatus === 'stopped') {
-        const strategies = this.activeStrategies.get(strategy.symbol);
-        if (strategies) {
-          const index = strategies.findIndex(s => s.id === strategy.id);
-          if (index !== -1) {
-            strategies.splice(index, 1);
-            if (strategies.length === 0) {
-              this.activeStrategies.delete(strategy.symbol);
-            }
-          }
+      try {
+        const { data, error } = await supabase
+          .from('active_strategies')
+          .update({
+            targets_hit: Array.from(targetsHit),
+            status: newStatus,
+            current_price: currentPrice,
+            last_check_at: new Date().toISOString()
+          })
+          .eq('id', strategy.id)
+          .select()
+          .single();
+        
+        if (error) {
+          console.error('[POSITION_MONITOR] Update error:', error.message);
+          return;
         }
+        
+        // Send Telegram notification
+        if (eventType) {
+          await this.sendNotification(strategy, eventType, currentPrice);
+        }
+        
+      } catch (error) {
+        console.error('[POSITION_MONITOR] Update error:', error);
       }
     } else {
-      // Silent update of current price
-      await this.updateCurrentPrice(strategy.id, currentPrice);
-      strategy.current_price = currentPrice;
-    }
-  }
-
-  private async updateStrategy(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy, eventType: string) {
-    try {
-      const { data, error } = await supabase
-        .from('active_strategies')
-        .update({
-          targets_hit: targetsHit,
-          status: status,
-          current_price: currentPrice,
-          last_check_at: new Date().toISOString()
-        })
-        .eq('id', strategyId)
-        .select();
-
-      if (error) {
-        console.error(`[POSITION] Error updating strategy:`, error.message);
-        return;
-      }
-
-      if (!data || data.length === 0) {
-        console.warn(`[POSITION] Strategy already updated (race condition)`);
-        return;
-      }
-
-      console.log(`[POSITION] ✓ Database updated: targets_hit=${targetsHit}, status=${status}`);
+      // Silent price update (less frequent)
+      // Only update every 5 price changes or if price changed significantly
+      const lastPrice = strategy.current_price || 0;
+      const priceChange = Math.abs((currentPrice - lastPrice) / lastPrice);
       
-      // Call Edge Function via HTTP
-      if (eventType) {
-        await this.notifyStrategyEvent(strategyId, targetsHit, status, currentPrice, strategy, eventType);
-      }
-
-    } catch (error) {
-      console.error(`[POSITION] Exception updating strategy:`, error);
-    }
-  }
-
-  private async notifyStrategyEvent(strategyId: string, targetsHit: number, status: string, currentPrice: number, strategy: ActiveStrategy, eventType: string) {
-    try {
-      if (!eventType) return;
-
-      const supabaseUrl = process.env.SUPABASE_URL;
-      const supabaseKey = process.env.SUPABASE_ANON_KEY;
-      
-      const response = await fetch(`${supabaseUrl}/functions/v1/notify-strategy-event`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${supabaseKey}`
-        },
-        body: JSON.stringify({
-          strategy_id: strategyId,
-          event_type: eventType,
-          symbol: strategy.symbol,
-          position_type: strategy.position_type,
-          current_price: currentPrice,
-          entry_min: strategy.entry_min,
-          entry_max: strategy.entry_max,
-          target_1: strategy.target_1,
-          target_2: strategy.target_2,
-          target_3: strategy.target_3,
-          stop_loss: strategy.stop_loss,
-          targets_hit: targetsHit,
-          status: status,
-          label: strategy.label
-        })
-      });
-
-      if (response.ok) {
-        console.log(`[POSITION] ✓ Telegram notification sent: ${eventType}`);
-      } else {
-        const errorText = await response.text();
-        console.error(`[POSITION] Edge Function error: ${response.status} - ${errorText}`);
-      }
-    } catch (error) {
-      console.error('[POSITION] Error calling Edge Function:', error);
-    }
-  }
-
-  private async updateCurrentPrice(strategyId: string, currentPrice: number) {
-    try {
-      await supabase
-        .from('active_strategies')
-        .update({
-          current_price: currentPrice,
-          last_check_at: new Date().toISOString()
-        })
-        .eq('id', strategyId);
-    } catch (error) {
-      // Ignore errors for silent updates
-    }
-  }
-}
-
-// ============================================================================
-// BINANCE WEBSOCKET MANAGER
-// ============================================================================
-
-class BinanceMonitor {
-  private ws: WebSocket | null = null;
-  private triggerDetector = new TriggerDetector();
-  private positionMonitor = new PositionMonitor();
-  private reconnectTimer: NodeJS.Timeout | null = null;
-  private statusCheckTimer: NodeJS.Timeout | null = null;
-  private pairCheckTimer: NodeJS.Timeout | null = null;
-  private monitoredSymbols: string[] = [];
-  private isMonitoring: boolean = false;
-
-  async start() {
-    console.log('[MONITOR] Monitoring service started');
-    console.log('[MONITOR] Waiting for scanner to be activated...');
-    
-    // Don't load pairs on startup - wait for scanner to start
-    // Pairs will be loaded when scanner_status becomes 'running'
-    
-    // Start status check loop
-    await this.positionMonitor.start();
-    
-    this.startStatusCheckLoop();
-  }
-
-  private async startStatusCheckLoop() {
-    // Check immediately
-    await this.checkAndUpdateStatus();
-    
-    // Then check every 10 seconds
-    this.statusCheckTimer = setInterval(async () => {
-      await this.checkAndUpdateStatus();
-    }, 10000);
-  }
-
-  private startPairCheckLoop() {
-    // Only start pair checking when monitoring is active
-    if (this.pairCheckTimer) {
-      return; // Already running
-    }
-    
-    console.log('[MONITOR] Starting pair check loop (every 60 seconds)');
-    
-    // Check immediately
-    this.checkAndUpdatePairs();
-    
-    // Then check every 60 seconds
-    this.pairCheckTimer = setInterval(async () => {
-      await this.checkAndUpdatePairs();
-    }, 60000);
-  }
-
-  private stopPairCheckLoop() {
-    if (this.pairCheckTimer) {
-      clearInterval(this.pairCheckTimer);
-      this.pairCheckTimer = null;
-      console.log('[MONITOR] Stopped pair check loop');
-    }
-  }
-
-  private async checkAndUpdatePairs() {
-    // Only check pairs if monitoring is active
-    if (!this.isMonitoring) {
-      return;
-    }
-    
-    console.log('[CONFIG] Checking for pair updates...');
-    const newPairs = await loadMonitoredPairs();
-    
-    // Compare with current pairs
-    const pairsChanged = JSON.stringify(newPairs.sort()) !== JSON.stringify(this.monitoredSymbols.sort());
-    
-    if (pairsChanged) {
-      console.log('[CONFIG] Monitored pairs changed!');
-      console.log('[CONFIG] Old pairs:', this.monitoredSymbols.join(', ') || 'none');
-      console.log('[CONFIG] New pairs:', newPairs.join(', ') || 'none');
-      
-      this.monitoredSymbols = newPairs;
-      
-      if (newPairs.length === 0) {
-        // Pairs became empty - disconnect from Binance
-        console.log('[MONITOR] All pairs removed - disconnecting from Binance...');
-        this.stopMonitoring();
-        console.log('[MONITOR] Waiting for trading pairs to be added...');
-      } else {
-        // Pairs changed - reconnect
-        console.log('[MONITOR] Reconnecting with new pairs...');
-        this.stopMonitoring();
-        // Small delay before reconnecting
-        setTimeout(() => {
-          this.startMonitoring();
-        }, 1000);
-      }
-    }
-  }
-
-  private async checkAndUpdateStatus() {
-    const status = await getScannerStatus();
-    
-    if (status === 'running' && !this.isMonitoring) {
-      console.log('[MONITOR] ✓ Scanner status: RUNNING - Starting monitoring...');
-      
-      // Load pairs now (only when starting)
-      console.log('[CONFIG] Loading monitored pairs from Supabase...');
-      this.monitoredSymbols = await loadMonitoredPairs();
-      
-      if (this.monitoredSymbols.length === 0) {
-        console.warn('[MONITOR] Cannot start - no trading pairs configured');
-        console.log('[MONITOR] Waiting for trading pairs to be added...');
-        return;
-      }
-      
-      console.log('[MONITOR] Monitored symbols configured:', this.monitoredSymbols.join(', '));
-      
-      // Start monitoring
-      this.startMonitoring();
-      
-      // Start pair check loop
-      this.startPairCheckLoop();
-      
-    } else if (status === 'stopped' && this.isMonitoring) {
-      console.log('[MONITOR] ✗ Scanner status: STOPPED - Stopping monitoring...');
-      this.stopMonitoring();
-      this.stopPairCheckLoop();
-    } else if (status === 'stopped' && !this.isMonitoring) {
-      // Still stopped, waiting (log less frequently)
-      // Only log every 6th check (once per minute)
-      const now = Date.now();
-      if (!this.lastStoppedLog || now - this.lastStoppedLog > 60000) {
-        console.log('[MONITOR] Waiting for scanner to start... (status: stopped)');
-        this.lastStoppedLog = now;
+      if (priceChange > 0.001) { // 0.1% change
+        await supabase
+          .from('active_strategies')
+          .update({
+            current_price: currentPrice,
+            last_check_at: new Date().toISOString()
+          })
+          .eq('id', strategy.id);
       }
     }
   }
   
-  private lastStoppedLog: number = 0;
-
-  private async startMonitoring() {
-    if (this.isMonitoring) return;
-    
-    // Double-check we have pairs
-    if (this.monitoredSymbols.length === 0) {
-      console.warn('[MONITOR] Cannot start monitoring - no trading pairs configured');
-      return;
+  private async sendNotification(
+    strategy: ActiveStrategy, 
+    eventType: string, 
+    currentPrice: number
+  ): Promise<void> {
+    try {
+      const response = await fetch(
+        `${CONFIG.SUPABASE_URL}/functions/v1/notify-strategy-event`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            strategyId: strategy.id,
+            symbol: strategy.symbol,
+            eventType,
+            currentPrice,
+            direction: strategy.direction,
+            targets: {
+              target_1: strategy.target_1,
+              target_2: strategy.target_2,
+              target_3: strategy.target_3,
+              stop_loss: strategy.stop_loss
+            }
+          })
+        }
+      );
+      
+      if (!response.ok) {
+        console.error('[POSITION_MONITOR] Notification error:', response.status);
+      } else {
+        console.log(`[POSITION_MONITOR] ✓ Notification sent for ${eventType}`);
+      }
+    } catch (error) {
+      console.error('[POSITION_MONITOR] Notification error:', error);
     }
+  }
+  
+  hasActiveStrategies(): boolean {
+    return this.strategies.size > 0;
+  }
+  
+  getMonitoredSymbols(): string[] {
+    return Array.from(this.strategies.keys());
+  }
+}
+
+// ============================================================================
+// BINANCE MONITOR (Main WebSocket Handler)
+// ============================================================================
+
+class BinanceMonitor {
+  private ws: WebSocket | null = null;
+  private monitoredSymbols: string[] = [];
+  private isMonitoring: boolean = false;
+  private triggerDetector: TriggerDetector;
+  private positionMonitor: PositionMonitor;
+  
+  private statusCheckInterval: NodeJS.Timeout | null = null;
+  private pairReloadInterval: NodeJS.Timeout | null = null;
+  
+  constructor() {
+    this.triggerDetector = new TriggerDetector();
+    this.positionMonitor = new PositionMonitor();
+  }
+  
+  async initialize(): Promise<void> {
+    console.log('[MONITOR] Initializing CryptoMind AI v3.2.0...');
+    console.log(`[MONITOR] Supabase URL: ${CONFIG.SUPABASE_URL ? '✓' : '✗'}`);
     
-    this.isMonitoring = true;
+    // Load thresholds from config
+    await this.triggerDetector.loadThresholds();
+    
+    // Start status check loop
+    this.startStatusCheckLoop();
     
     // Start position monitor
     await this.positionMonitor.start();
     
-    console.log('[MONITOR] Starting Binance WebSocket connection...');
-    this.connect();
+    console.log('[MONITOR] ✓ Initialization complete');
   }
-
-  private stopMonitoring() {
-    if (!this.isMonitoring) {
-      // Already stopped, just clean up
-      if (this.ws) {
-        this.ws.close();
-        this.ws = null;
+  
+  private startStatusCheckLoop(): void {
+    this.statusCheckInterval = setInterval(async () => {
+      await this.checkAndUpdateStatus();
+    }, CONFIG.STATUS_CHECK_INTERVAL);
+    
+    // Also run immediately
+    this.checkAndUpdateStatus();
+  }
+  
+  private async checkAndUpdateStatus(): Promise<void> {
+    try {
+      const { data, error } = await supabase
+        .from('system_config')
+        .select('value')
+        .eq('key', 'scanner_status')
+        .single();
+      
+      if (error) {
+        console.error('[STATUS] Error fetching status:', error.message);
+        return;
       }
+      
+      const status = JSON.parse(data.value);
+      
+      if (status === 'running' && !this.isMonitoring) {
+        console.log('[STATUS] Scanner starting...');
+        await this.startMonitoring();
+      } else if (status === 'stopped' && this.isMonitoring) {
+        console.log('[STATUS] Scanner stopping...');
+        this.stopMonitoring();
+      }
+    } catch (error) {
+      console.error('[STATUS] Check error:', error);
+    }
+  }
+  
+  private async startMonitoring(): Promise<void> {
+    // Load monitored pairs
+    this.monitoredSymbols = await this.loadMonitoredPairs();
+    
+    if (this.monitoredSymbols.length === 0) {
+      console.log('[MONITOR] No pairs configured - waiting...');
       return;
     }
     
-    // Stop position monitor
-    this.positionMonitor.stop();
+    // Connect to Binance
+    this.connect();
     
-    this.isMonitoring = false;
-    console.log('[MONITOR] Stopping Binance WebSocket connection...');
+    // Start pair reload loop
+    this.startPairReloadLoop();
     
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-
+    this.isMonitoring = true;
+    console.log(`[MONITOR] ✓ Started monitoring ${this.monitoredSymbols.length} pairs`);
+  }
+  
+  private stopMonitoring(): void {
+    // Disconnect WebSocket
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
     
-    // Reset detector state when stopping
-    this.triggerDetector.reset();
-    
-    console.log('[MONITOR] ✓ Monitoring stopped');
-  }
-
-  private connect() {
-    if (!this.isMonitoring) return;
-    
-    if (this.monitoredSymbols.length === 0) {
-      console.warn('[MONITOR] Cannot connect - no pairs configured');
-      return;
+    // Stop pair reload loop
+    if (this.pairReloadInterval) {
+      clearInterval(this.pairReloadInterval);
+      this.pairReloadInterval = null;
     }
     
+    // Clear trackers
+    this.triggerDetector.clear();
+    
+    this.isMonitoring = false;
+    console.log('[MONITOR] ✓ Stopped');
+  }
+  
+  private async loadMonitoredPairs(): Promise<string[]> {
     try {
-      // Build streams
-      const streams = this.monitoredSymbols.map(symbol => 
-        `${symbol.toLowerCase()}@ticker`
-      ).join('/');
-
-      // FUTURES WebSocket (not SPOT)
-      const wsUrl = `wss://fstream.binance.com/stream?streams=${streams}`;
+      const { data, error } = await supabase
+        .from('system_config')
+        .select('value')
+        .eq('key', 'monitored_pairs')
+        .single();
       
-      console.log('[MONITOR] Connecting to Binance Futures WebSocket...');
-      this.ws = new WebSocket(wsUrl);
-
-      this.ws.on('open', () => {
-        console.log('[MONITOR] ✓ Connected to Binance Futures WebSocket');
-        console.log(`[MONITOR] ✓ Subscribed to ${this.monitoredSymbols.length} symbols`);
-      });
-
-      this.ws.on('message', (data: WebSocket.Data) => {
-        this.handleMessage(data);
-      });
-
-      this.ws.on('error', (error) => {
-        console.error('[MONITOR] WebSocket error:', error.message);
-      });
-
-      this.ws.on('close', () => {
-        console.log('[MONITOR] WebSocket closed');
-        
-        // Only reconnect if still monitoring
-        if (this.isMonitoring) {
-          console.log('[MONITOR] Reconnecting in 5 seconds...');
-          this.scheduleReconnect();
+      if (error) {
+        console.error('[CONFIG] Error loading pairs:', error.message);
+        return [];
+      }
+      
+      const pairs = JSON.parse(data.value);
+      console.log(`[CONFIG] ✓ Loaded pairs: ${pairs.join(', ')}`);
+      return pairs;
+    } catch (error) {
+      console.error('[CONFIG] Load pairs error:', error);
+      return [];
+    }
+  }
+  
+  private startPairReloadLoop(): void {
+    this.pairReloadInterval = setInterval(async () => {
+      await this.checkAndUpdatePairs();
+    }, CONFIG.PAIR_RELOAD_INTERVAL);
+  }
+  
+  private async checkAndUpdatePairs(): Promise<void> {
+    const newPairs = await this.loadMonitoredPairs();
+    
+    // Check if pairs changed
+    const changed = newPairs.length !== this.monitoredSymbols.length ||
+      newPairs.some((p, i) => p !== this.monitoredSymbols[i]);
+    
+    if (changed) {
+      console.log('[CONFIG] Pairs changed - reconnecting...');
+      
+      if (newPairs.length === 0) {
+        // No pairs - disconnect
+        if (this.ws) {
+          this.ws.close();
+          this.ws = null;
         }
-      });
-
-    } catch (error) {
-      console.error('[MONITOR] Connection error:', error);
-      if (this.isMonitoring) {
-        this.scheduleReconnect();
-      }
-    }
-  }
-
-  private handleMessage(data: WebSocket.Data) {
-    try {
-      const message = JSON.parse(data.toString());
-      
-      if (message.stream && message.data) {
-        const symbol = message.stream.replace('@ticker', '').toUpperCase();
-        const tickerData = message.data;
-
-        // Check triggers
-        this.triggerDetector.checkVolumeTrigger(symbol, tickerData);
-        this.triggerDetector.checkPriceTrigger(symbol, tickerData);
-        
-        // Check position targets and stop-loss
-        const currentPrice = parseFloat(tickerData.c);
-        this.positionMonitor.checkPrice(symbol, currentPrice);
-      }
-    } catch (error) {
-      // Ignore parse errors (heartbeats, etc.)
-    }
-  }
-
-  private scheduleReconnect() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-    }
-
-    this.reconnectTimer = setTimeout(() => {
-      if (this.isMonitoring && this.monitoredSymbols.length > 0) {
+        this.monitoredSymbols = [];
+        console.log('[CONFIG] No pairs configured');
+      } else {
+        // Reconnect with new pairs
+        this.monitoredSymbols = newPairs;
+        if (this.ws) {
+          this.ws.close();
+        }
         this.connect();
       }
-    }, 5000);
+    }
   }
-
-  stop() {
-    console.log('[MONITOR] Shutting down monitoring service...');
+  
+  private connect(): void {
+    if (this.monitoredSymbols.length === 0) return;
     
-    if (this.statusCheckTimer) {
-      clearInterval(this.statusCheckTimer);
-      this.statusCheckTimer = null;
+    // Build stream URL for all pairs (FUTURES WebSocket)
+    const streams = this.monitoredSymbols
+      .map(s => `${s.toLowerCase()}@ticker`)
+      .join('/');
+    
+    const url = `${CONFIG.BINANCE_WS_URL}?streams=${streams}`;
+    
+    console.log(`[WS] Connecting to Binance Futures...`);
+    
+    this.ws = new WebSocket(url);
+    
+    this.ws.on('open', () => {
+      console.log(`[WS] ✓ Connected to Binance Futures`);
+      console.log(`[WS] Monitoring: ${this.monitoredSymbols.join(', ')}`);
+    });
+    
+    this.ws.on('message', async (data: WebSocket.Data) => {
+      try {
+        const message: TickerData = JSON.parse(data.toString());
+        
+        if (message.data && message.data.s) {
+          // Process for trigger detection
+          await this.triggerDetector.processTicker(message.data);
+          
+          // Process for position monitoring
+          const price = parseFloat(message.data.c);
+          await this.positionMonitor.checkPrice(message.data.s, price);
+        }
+      } catch (error) {
+        console.error('[WS] Message parse error:', error);
+      }
+    });
+    
+    this.ws.on('close', () => {
+      console.log('[WS] Disconnected');
+      
+      // Auto-reconnect if still monitoring
+      if (this.isMonitoring && this.monitoredSymbols.length > 0) {
+        console.log('[WS] Reconnecting in 5 seconds...');
+        setTimeout(() => this.connect(), 5000);
+      }
+    });
+    
+    this.ws.on('error', (error) => {
+      console.error('[WS] Error:', error);
+    });
+  }
+  
+  /**
+   * Graceful shutdown
+   */
+  async shutdown(): Promise<void> {
+    console.log('[MONITOR] Shutting down...');
+    
+    if (this.statusCheckInterval) {
+      clearInterval(this.statusCheckInterval);
     }
     
-    this.stopPairCheckLoop();
     this.stopMonitoring();
+    this.positionMonitor.stop();
+    
+    console.log('[MONITOR] ✓ Shutdown complete');
   }
 }
 
 // ============================================================================
-// MAIN
+// MAIN ENTRY POINT
 // ============================================================================
 
-async function main() {
+async function main(): Promise<void> {
   console.log('='.repeat(60));
-  console.log('CryptoMind AI - Monitoring Service v1.2.0');
+  console.log('  CryptoMind AI - Railway Monitoring Service v3.2.0');
   console.log('='.repeat(60));
-
-  // Validate environment
-  if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('[ERROR] Missing environment variables!');
-    console.error('[ERROR] Required: SUPABASE_URL, SUPABASE_ANON_KEY');
-    process.exit(1);
-  }
-
-  console.log('[CONFIG] Supabase URL:', SUPABASE_URL);
-
-  // Start monitor
+  console.log('');
+  console.log('Features:');
+  console.log('  ✓ Real-time market monitoring (Binance Futures WebSocket)');
+  console.log('  ✓ Volume spike detection');
+  console.log('  ✓ Price movement detection');
+  console.log('  ✓ Position monitoring (T1/T2/T3, Stop Loss)');
+  console.log('  ✓ Circuit Breaker (flash crash protection)');
+  console.log('  ✓ Telegram notifications');
+  console.log('');
+  
   const monitor = new BinanceMonitor();
-  await monitor.start();
-
-  // Handle shutdown
-  process.on('SIGINT', () => {
-    console.log('\n[SHUTDOWN] Received SIGINT, stopping...');
-    monitor.stop();
+  
+  // Handle graceful shutdown
+  process.on('SIGINT', async () => {
+    await monitor.shutdown();
     process.exit(0);
   });
-
-  process.on('SIGTERM', () => {
-    console.log('\n[SHUTDOWN] Received SIGTERM, stopping...');
-    monitor.stop();
+  
+  process.on('SIGTERM', async () => {
+    await monitor.shutdown();
     process.exit(0);
   });
-
-  console.log('[MONITOR] Service running. Checking scanner status every 10 seconds...');
-  console.log('[MONITOR] Note: Using Binance FUTURES data (fstream.binance.com)');
-  console.log('[MONITOR] Note: Database trigger will automatically invoke analyze-full for new triggers');
-  console.log('[MONITOR] Note: Entry range notifications enabled for waiting_entry strategies');
+  
+  // Start monitoring
+  await monitor.initialize();
 }
 
-// Start
-main().catch(err => {
-  console.error('[FATAL]', err);
+// Run
+main().catch((error) => {
+  console.error('[FATAL] Startup error:', error);
   process.exit(1);
 });
